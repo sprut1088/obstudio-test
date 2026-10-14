@@ -1,0 +1,22 @@
+{
+  "name": "obstudio",
+  "interface": {
+    "displayName": "Splunk Observability Studio"
+  },
+  "plugins": [
+    {
+      "name": "obstudio",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/signalfx/obstudio.git",
+        "path": "./plugins/obstudio",
+        "ref": "v0.1.1"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "skill": "otel-instrument",
+  "prompts": [
+    {
+      "id": "runtime-preserving",
+      "task": "Instrument the Go chi service in ./service with OpenTelemetry while preserving the existing runtime and startup command. Add auto-instrumentation only; do not add custom business spans. Use the official OpenTelemetry Go HTTP instrumentation that is already compatible with this module graph, such as otelhttp; do not invent or add an otelchi module/version unless it is confirmed to exist in the module proxy."
+    }
+  ],
+  "checks": [
+    {
+      "id": "observer-runtime-telemetry",
+      "description": "Docker runtime emits Go chi traces and HTTP duration metrics to Splunk Observability Studio.",
+      "compose_file": "docker-compose.yml",
+      "timeout_seconds": 300,
+      "expect": {
+        "clear_path": null,
+        "endpoints": [
+          {
+            "id": "traces",
+            "url": "/api/query/traces",
+            "field_checks": {
+              "span_names": ["server"]
+            }
+          },
+          {
+            "id": "metrics",
+            "url": "/api/query/metrics",
+            "contains_any": [
+              "http.server.request.duration",
+              "http.server.duration"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

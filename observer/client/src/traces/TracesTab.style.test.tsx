@@ -1,0 +1,526 @@
+// @vitest-environment happy-dom
+
+import React from "react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TracesTab, traceStatusLabel } from "./TracesTab";
+import { SpanDetailsPanel } from "./SpanDetailsPanel";
+import { MetricsTab } from "../metrics/MetricsTab";
+import type { Span } from "../api/types";
+
+declare const require: (id: string) => any;
+declare const process: { cwd(): string };
+
+vi.mock("@tanstack/react-virtual", () => ({
+  useVirtualizer: ({ count }: { count: number }) => ({
+    getTotalSize: () => count * 36,
+    getVirtualItems: () =>
+      Array.from({ length: count }, (_, index) => ({
+        index,
+        key: index,
+        start: index * 36,
+        end: (index + 1) * 36,
+        size: 36,
+      })),
+    measureElement: () => undefined,
+  }),
+}));
+
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
+
+function selectFilterField(label: string): void {
+  fireEvent.click(screen.getByRole("button", { name: "Add filter" }));
+  const menu = document.querySelector<HTMLElement>(".filter-builder__menu")!;
+  const items = menu.querySelectorAll<HTMLElement>(".filter-builder__menu-item");
+  const target = Array.from(items).find((el) => el.querySelector(".filter-builder__menu-key")?.textContent === label);
+  if (!target) throw new Error(`Filter field "${label}" not found in menu`);
+  fireEvent.mouseDown(target);
+}
+
+describe("TracesTab row layout", () => {
+  beforeEach(() => {
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      value: 400,
+    });
+    Object.defineProperty(HTMLElement.prototype, "clientWidth", {
+      configurable: true,
+      value: 1200,
+    });
+    HTMLElement.prototype.getBoundingClientRect = () =>
+      ({
+        width: 1200,
+        height: 400,
+        top: 0,
+        left: 0,
+        right: 1200,
+        bottom: 400,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      }) as DOMRect;
+  });
+
+  it("renders trace id as a dedicated table column", () => {
+    const { container } = render(
+      <TracesTab
+        traces={[
+          { traceId: "trace-1234567890ab", rootSpanName: "GET /orders", serviceName: "checkout", spanCount: 3, durationMs: 42, status: "error" },
+        ]}
+        telemetryError={null}
+        onInteract={vi.fn()}
+        validationFindings={[]}
+        validationIndex={{ trace: new Map(), span: new Map(), metric: new Map(), log: new Map() }}
+      />,
+    );
+
+    expect(screen.getByText("Trace ID")).toBeTruthy();
+    expect(screen.getByText("Service")).toBeTruthy();
+    expect(screen.getByText("Status")).toBeTruthy();
+    expect(screen.getByText("Duration")).toBeTruthy();
+    const addFilterBtn = screen.getByRole("button", { name: "Add filter" });
+    expect(addFilterBtn).toBeTruthy();
+    fireEvent.click(addFilterBtn);
+    expect(screen.getByText("Indexed Tags")).toBeTruthy();
+    const menu = container.querySelector(".filter-builder__menu");
+    expect(menu?.textContent).toContain("Service");
+    expect(menu?.textContent).toContain("Min Duration");
+    expect(menu?.textContent).not.toContain("Time From");
+    expect(menu?.textContent).not.toContain("Time To");
+    expect(container.querySelector(".filter-builder__menu-ops")).toBeNull();
+    expect(container.querySelector(".filter-builder__menu-op")).toBeNull();
+    expect(container.querySelector(".status-dot")).toBeNull();
+    expect(container.querySelector(".data-table__head--left-cluster")).toBeTruthy();
+    expect(container.querySelector(".data-table__body-inner--traces")).toBeTruthy();
+    expect(container.querySelector(".trace-row__stack")).toBeNull();
+    expect(container.querySelector(".trace-row__operation")?.classList.contains("explorer-row__primary")).toBe(true);
+    expect(container.querySelector(".data-table__td--trace-id .trace-row__trace-id")?.classList.contains("explorer-row__secondary")).toBe(true);
+    expect(container.querySelector(".trace-row__trace-id")?.classList.contains("mono")).toBe(false);
+    expect(container.querySelector(".trace-row__trace-id")?.textContent).toBe("trace-1234567890ab");
+    expect(container.querySelector(".trace-row__service")?.classList.contains("explorer-row__secondary")).toBe(true);
+    expect(container.querySelector(".data-table__td--service")?.textContent).toBe("checkout");
+    expect(container.querySelector(".validation-badge")).toBeNull();
+    expect(container.querySelector(".data-table__td--status")?.textContent).toContain("error");
+    expect(container.querySelector(".data-table__td--duration .explorer-row__numeric")).toBeTruthy();
+  });
+
+  it("filters traces by the dedicated status and trace id columns via the REST query endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [
+        { traceId: "trace-error-123", rootSpanName: "POST /payments", serviceName: "api-gateway", spanCount: 2, durationMs: 42, status: "error" },
+      ],
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const view = render(
+      <TracesTab
+        traces={[
+          { traceId: "trace-error-123", rootSpanName: "POST /payments", serviceName: "api-gateway", spanCount: 2, durationMs: 42, status: "error" },
+          { traceId: "trace-ok-456", rootSpanName: "GET /health", serviceName: "api-gateway", spanCount: 1, durationMs: 5, status: "ok" },
+        ]}
+        telemetryError={null}
+        onInteract={vi.fn()}
+        validationFindings={[]}
+        validationIndex={{ trace: new Map(), span: new Map(), metric: new Map(), log: new Map() }}
+      />,
+    );
+
+    selectFilterField("Status");
+    expect((view.getByRole("radio", { name: "=" }) as HTMLButtonElement).classList.contains("filter-builder__operator--active")).toBe(true);
+    fireEvent.change(view.getByLabelText("status value"), { target: { value: "error" } });
+    fireEvent.click(view.getByRole("button", { name: "Apply filter" }));
+
+    await act(async () => {});
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/query/traces?filter%5Bstatus%5D%5Beq%5D=error", expect.any(Object));
+    expect(view.getByText("POST /payments")).toBeTruthy();
+    expect(view.queryByText("GET /health")).toBeNull();
+  });
+
+  it("uses descriptive filter placeholders instead of example query text", () => {
+    render(
+      <MetricsTab
+        metrics={[
+          {
+            name: "http.server.duration",
+            description: "Request duration",
+            unit: "ms",
+            type: "histogram",
+            serviceName: "checkout",
+            scopeName: "otel",
+            dataPointCount: 1,
+            dataPoints: [],
+          },
+        ]}
+        telemetryError={null}
+        onInteract={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Add filter" })).toBeTruthy();
+
+    selectFilterField("Service");
+    expect(screen.getByLabelText("serviceName value").getAttribute("placeholder")).toBe("Enter checkout");
+  });
+
+  it("uses semantic operator labels for min and max bound filters", () => {
+    render(
+      <TracesTab
+        traces={[
+          { traceId: "trace-1234567890ab", rootSpanName: "GET /orders", serviceName: "checkout", spanCount: 3, durationMs: 42, status: "error" },
+        ]}
+        telemetryError={null}
+        onInteract={vi.fn()}
+        validationFindings={[]}
+        validationIndex={{ trace: new Map(), span: new Map(), metric: new Map(), log: new Map() }}
+      />,
+    );
+
+    selectFilterField("Min Duration");
+    expect(screen.getByRole("radio", { name: ">=" })).toBeTruthy();
+    expect(screen.getByRole("radio", { name: "<" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset filter draft" }));
+    selectFilterField("Max Span Count");
+    expect(screen.getByRole("radio", { name: "<=" })).toBeTruthy();
+    expect(screen.getByRole("radio", { name: ">" })).toBeTruthy();
+  });
+
+  it("does not allow negative values in numeric filters", () => {
+    render(
+      <TracesTab
+        traces={[
+          { traceId: "trace-1234567890ab", rootSpanName: "GET /orders", serviceName: "checkout", spanCount: 3, durationMs: 42, status: "error" },
+        ]}
+        telemetryError={null}
+        onInteract={vi.fn()}
+        validationFindings={[]}
+        validationIndex={{ trace: new Map(), span: new Map(), metric: new Map(), log: new Map() }}
+      />,
+    );
+
+    selectFilterField("Min Duration");
+    const input = screen.getByLabelText("minDurationMs value") as HTMLInputElement;
+
+    expect(input.getAttribute("min")).toBe("0");
+
+    fireEvent.change(input, { target: { value: "-5" } });
+    expect(input.value).toBe("");
+  });
+
+  it("uses whole-number inputs for count filters", () => {
+    render(
+      <TracesTab
+        traces={[
+          { traceId: "trace-1234567890ab", rootSpanName: "GET /orders", serviceName: "checkout", spanCount: 3, durationMs: 42, status: "error" },
+        ]}
+        telemetryError={null}
+        onInteract={vi.fn()}
+        validationFindings={[]}
+        validationIndex={{ trace: new Map(), span: new Map(), metric: new Map(), log: new Map() }}
+      />,
+    );
+
+    selectFilterField("Min Span Count");
+    const input = screen.getByLabelText("minSpanCount value") as HTMLInputElement;
+
+    expect(input.getAttribute("step")).toBe("1");
+
+    fireEvent.change(input, { target: { value: "1.5" } });
+    expect(input.value).toBe("");
+  });
+
+  it("shows explicit labels for all trace statuses", () => {
+    expect(traceStatusLabel("ok")).toBe("ok");
+    expect(traceStatusLabel("error")).toBe("error");
+    expect(traceStatusLabel("mixed")).toBe("mixed");
+    expect(traceStatusLabel("unset")).toBe("unset");
+    expect(traceStatusLabel("weird")).toBe("unknown");
+  });
+
+  it("does not render validation rule ids in the span detail panel", () => {
+    render(
+      <SpanDetailsPanel
+        span={{
+          traceId: "trace-1",
+          spanId: "span-1",
+          parentSpanId: "",
+          name: "GET /orders",
+          kind: "SERVER",
+          startTimeUnixNano: "2026-04-11T12:00:00Z",
+          endTimeUnixNano: "2026-04-11T12:00:01Z",
+          durationMs: 1,
+          status: { code: "ERROR", message: "" },
+          attributes: {},
+          events: [],
+          links: [],
+          resource: { serviceName: "checkout", attributes: {} },
+          scope: { name: "otel", version: "" },
+        }}
+        validationFindings={[
+          {
+            entityKey: "span:trace-1:span-1",
+            source: "weaver",
+            ruleId: "invalid_format",
+            severity: "violation",
+            message: "Attribute 'traceId' does not match name formatting rules.",
+            signal: {
+              type: "span",
+              serviceName: "checkout",
+              traceId: "trace-1",
+              spanId: "span-1",
+              spanName: "GET /orders",
+            },
+            updatedAt: "2026-04-11T12:00:00Z",
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("Attribute 'traceId' does not match name formatting rules.")).toBeTruthy();
+    expect(screen.queryByText("invalid_format")).toBeNull();
+  });
+
+  it("renders a close button in the span detail panel when onClose is provided", () => {
+    const onClose = vi.fn();
+    render(
+      <SpanDetailsPanel
+        span={{
+          traceId: "trace-1",
+          spanId: "span-1",
+          parentSpanId: "",
+          name: "GET /orders",
+          kind: "SERVER",
+          startTimeUnixNano: "2026-04-11T12:00:00Z",
+          endTimeUnixNano: "2026-04-11T12:00:01Z",
+          durationMs: 42,
+          status: { code: "OK", message: "" },
+          attributes: {
+            "gen_ai.evaluation.name": "groundedness",
+            "gen_ai.evaluation.score.value": 0.32,
+            "gen_ai.evaluation.explanation": "Answer was not grounded in retrieved context.",
+            "assistant.evaluation.outcome": "failed",
+          },
+          events: [],
+          links: [],
+          resource: { serviceName: "checkout", attributes: {} },
+          scope: { name: "otel", version: "" },
+        }}
+        validationFindings={[]}
+        onClose={onClose}
+      />,
+    );
+
+    const closeBtn = screen.getByRole("button", { name: "Close span details" });
+    expect(closeBtn).toBeTruthy();
+    fireEvent.click(closeBtn);
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("opens AI details for spans with GenAI evaluation issues", () => {
+    render(
+      <SpanDetailsPanel
+        span={{
+          traceId: "trace-1",
+          spanId: "span-1",
+          parentSpanId: "",
+          name: "chat gpt-5.5",
+          kind: "INTERNAL",
+          startTimeUnixNano: "2026-04-11T12:00:00Z",
+          endTimeUnixNano: "2026-04-11T12:00:01Z",
+          durationMs: 42,
+          status: { code: "OK", message: "" },
+          attributes: {},
+          events: [
+            {
+              name: "gen_ai.evaluation.result",
+              timeUnixNano: "2026-04-11T12:00:00.500Z",
+              attributes: {
+                "gen_ai.evaluation.name": "groundedness",
+                "gen_ai.evaluation.score.label": "fail",
+                "gen_ai.evaluation.score.value": 0.32,
+                "gen_ai.evaluation.explanation": "Answer was not grounded in retrieved context.",
+                "assistant.evaluation.outcome": "failed",
+              },
+            },
+          ],
+          links: [],
+          resource: { serviceName: "assistant", attributes: {} },
+          scope: { name: "otel", version: "" },
+        }}
+        validationFindings={[]}
+      />,
+    );
+
+    expect(screen.getByRole("tab", { name: /AI details/i }).classList.contains("span-details__tab--active")).toBe(true);
+    expect(screen.getByText("Evaluations")).toBeTruthy();
+    expect(screen.getByText("1 issue")).toBeTruthy();
+    expect(screen.getByText("Groundedness")).toBeTruthy();
+    expect(screen.getByText("fail")).toBeTruthy();
+    expect(screen.getByText("0.32")).toBeTruthy();
+    expect(screen.getByText("Answer was not grounded in retrieved context.")).toBeTruthy();
+  });
+
+  it("does not reset the selected details tab when evaluations arrive for the same span", () => {
+    const span: Span = {
+      traceId: "trace-1",
+      spanId: "span-1",
+      parentSpanId: "",
+      name: "chat gpt-5.5",
+      kind: "INTERNAL",
+      startTimeUnixNano: "2026-04-11T12:00:00Z",
+      endTimeUnixNano: "2026-04-11T12:00:01Z",
+      durationMs: 42,
+      status: { code: "OK", message: "" },
+      attributes: {},
+      events: [],
+      links: [],
+      resource: { serviceName: "assistant", attributes: {} },
+      scope: { name: "otel", version: "" },
+    };
+    const { rerender } = render(<SpanDetailsPanel span={span} validationFindings={[]} />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Attributes" }));
+    expect(screen.getByRole("tab", { name: "Attributes" }).classList.contains("span-details__tab--active")).toBe(true);
+
+    rerender(
+      <SpanDetailsPanel
+        span={{
+          ...span,
+          events: [
+            {
+              name: "gen_ai.evaluation.result",
+              timeUnixNano: "2026-04-11T12:00:00.500Z",
+              attributes: {
+                "gen_ai.evaluation.name": "groundedness",
+                "gen_ai.evaluation.score.label": "fail",
+                "assistant.evaluation.outcome": "failed",
+              },
+            },
+          ],
+        }}
+        validationFindings={[]}
+      />,
+    );
+
+    expect(screen.getByRole("tab", { name: "Attributes" }).classList.contains("span-details__tab--active")).toBe(true);
+    expect(screen.getByRole("tab", { name: /AI details/i })).toBeTruthy();
+  });
+
+  it("does not render a close button in the span detail panel when onClose is not provided", () => {
+    render(
+      <SpanDetailsPanel
+        span={{
+          traceId: "trace-1",
+          spanId: "span-1",
+          parentSpanId: "",
+          name: "GET /orders",
+          kind: "SERVER",
+          startTimeUnixNano: "2026-04-11T12:00:00Z",
+          endTimeUnixNano: "2026-04-11T12:00:01Z",
+          durationMs: 42,
+          status: { code: "OK", message: "" },
+          attributes: {},
+          events: [],
+          links: [],
+          resource: { serviceName: "checkout", attributes: {} },
+          scope: { name: "otel", version: "" },
+        }}
+        validationFindings={[]}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Close span details" })).toBeNull();
+  });
+
+  it("span detail panel header status badge does not use trace-status--plain", () => {
+    const { container } = render(
+      <SpanDetailsPanel
+        span={{
+          traceId: "trace-1",
+          spanId: "span-1",
+          parentSpanId: "",
+          name: "GET /orders",
+          kind: "SERVER",
+          startTimeUnixNano: "2026-04-11T12:00:00Z",
+          endTimeUnixNano: "2026-04-11T12:00:01Z",
+          durationMs: 42,
+          status: { code: "OK", message: "" },
+          attributes: {},
+          events: [],
+          links: [],
+          resource: { serviceName: "checkout", attributes: {} },
+          scope: { name: "otel", version: "" },
+        }}
+        validationFindings={[]}
+      />,
+    );
+
+    const badge = container.querySelector(".span-details__meta .trace-status");
+    expect(badge).toBeTruthy();
+    expect(badge?.classList.contains("trace-status--ok")).toBe(true);
+    expect(badge?.classList.contains("trace-status--plain")).toBe(false);
+  });
+
+  it("uses bounded per-tab column caps with trailing spacer tracks", () => {
+    const { readFileSync } = require("fs");
+    const { resolve } = require("path");
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+
+    expect(css).toContain(".data-table__head--metrics,\n.data-table__row--metrics {\n  --table-columns: minmax(80px, 2fr) minmax(80px, 3fr) minmax(80px, 1fr);\n}");
+    expect(css).toContain(".data-table__head--traces,\n.data-table__row--traces {\n  --table-columns: minmax(128px, 3fr) minmax(80px, 4fr) minmax(96px, 2fr) minmax(64px, 1fr) minmax(72px, 1fr) minmax(48px, 1fr);\n}");
+    expect(css).toContain(".data-table__head--logs,\n.data-table__row--logs {\n  --table-columns: minmax(72px, 1fr) minmax(96px, 2fr) minmax(96px, 3fr) minmax(256px, 6fr);\n}");
+  });
+
+  it("uses the same compact row shell height as logs for master rows", () => {
+    const { readFileSync } = require("fs");
+    const { resolve } = require("path");
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+
+    expect(css).toContain(".data-table__head--traces,\n.data-table__row--traces {\n  --table-columns: minmax(128px, 3fr) minmax(80px, 4fr) minmax(96px, 2fr) minmax(64px, 1fr) minmax(72px, 1fr) minmax(48px, 1fr);\n}");
+    expect(css).toContain(".data-table__row--traces {\n  align-items: center;\n  min-height: 32px;\n}");
+    expect(css).toContain(".data-table__row--traces .data-table__td {\n  padding-top: 3px;\n  padding-bottom: 3px;\n}");
+    expect(css).toContain(".filter-builder {\n  display: flex;\n  flex: 1 1 auto;");
+    expect(css).toContain(".filter-builder__composer--selected {\n  position: relative;\n  display: flex;\n  flex: 1 1 auto;");
+    expect(css).toContain(".filter-builder__value-wrapper {\n  position: relative;\n  display: flex;\n  flex: 1 1 auto;");
+    expect(css).toContain(".filter-builder__value {\n  flex: 1 1 auto;\n  min-width: 0;\n  width: 0;\n}");
+    expect(css).toContain(".filter-builder__trigger {\n  display: inline-flex;");
+  });
+
+  it("left-aligns stacked trace and metric values so content does not stretch across the cell", () => {
+    const { readFileSync } = require("fs");
+    const { resolve } = require("path");
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+
+    expect(css).toContain(".data-table__td--operation {\n  min-width: 0;\n}");
+    expect(css).toContain(".trace-row__operation {\n  display: inline-block;\n  max-width: 100%;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}");
+    expect(css).toContain(".data-table__td--trace-id {\n  min-width: 0;\n}");
+    expect(css).toContain(".trace-row__trace-id {\n  display: inline-block;\n  max-width: 100%;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}");
+    expect(css).toContain(".metric-card__description {\n  display: block;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}");
+  });
+
+  it("constrains table headers so narrow count columns do not bleed into neighbors", () => {
+    const { readFileSync } = require("fs");
+    const { resolve } = require("path");
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+
+    expect(css).toContain(".data-table__th {\n  display: flex;\n  align-items: center;\n  justify-content: flex-start;\n  font-size: 12px;");
+    expect(css).toContain(".data-table__td {\n  display: flex;\n  align-items: center;\n  justify-content: flex-start;\n  padding: 3px 6px;");
+    expect(css).toContain(".data-table__th--numeric,\n.data-table__td--numeric {\n  justify-self: stretch;\n  text-align: right;\n  justify-content: flex-end;\n}");
+  });
+
+  it("uses the same vertical centering model for metric and validation master cells", () => {
+    const { readFileSync } = require("fs");
+    const { resolve } = require("path");
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+
+    expect(css).toContain(".data-table__cell-content {\n  display: flex;\n  align-items: center;\n  justify-content: flex-start;\n  width: 100%;\n  min-width: 0;\n}");
+    expect(css).toContain(".data-table__cell-content--meta {\n  gap: 8px;\n}");
+    expect(css).toContain(".data-table__td--metric-meta {\n  display: flex;\n  align-items: center;\n  justify-content: flex-start;\n  min-width: 0;\n}");
+  });
+});

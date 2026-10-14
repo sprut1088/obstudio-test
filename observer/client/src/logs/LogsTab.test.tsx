@@ -1,0 +1,631 @@
+// @vitest-environment happy-dom
+
+import React from "react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { LogsTab } from "./LogsTab";
+
+vi.mock("@tanstack/react-virtual", () => ({
+  useVirtualizer: ({ count }: { count: number }) => ({
+    getTotalSize: () => count * 36,
+    getVirtualItems: () =>
+      Array.from({ length: count }, (_, index) => ({
+        index,
+        key: index,
+        start: index * 36,
+        end: (index + 1) * 36,
+        size: 36,
+      })),
+    measureElement: () => undefined,
+  }),
+}));
+
+function selectFilterField(label: string): void {
+  fireEvent.click(screen.getByRole("button", { name: "Add filter" }));
+  const menu = document.querySelector<HTMLElement>(".filter-builder__menu")!;
+  const items = menu.querySelectorAll<HTMLElement>(".filter-builder__menu-item");
+  const target = Array.from(items).find((el) => el.querySelector(".filter-builder__menu-key")?.textContent === label);
+  if (!target) throw new Error(`Filter field "${label}" not found in menu`);
+  fireEvent.mouseDown(target);
+}
+
+describe("LogsTab", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      value: 400,
+    });
+    Object.defineProperty(HTMLElement.prototype, "clientWidth", {
+      configurable: true,
+      value: 1200,
+    });
+    HTMLElement.prototype.getBoundingClientRect = () =>
+      ({
+        width: 1200,
+        height: 400,
+        top: 0,
+        left: 0,
+        right: 1200,
+        bottom: 400,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      }) as DOMRect;
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("filters logs from the compact explorer toolbar via the REST query endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [
+        {
+          id: "2",
+          timeUnixNano: "1712700000000000001",
+          severityText: "ERROR",
+          body: "payment failed",
+          attributes: {},
+          resource: { serviceName: "payments", attributes: {} },
+          scope: { name: "otel" },
+        },
+      ],
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { container } = render(
+      <LogsTab
+        logs={[
+          {
+            id: "1",
+            timeUnixNano: "1712700000000000000",
+            severityText: "INFO",
+            body: "checkout started",
+            attributes: {},
+            resource: { serviceName: "checkout", attributes: {} },
+            scope: { name: "otel" },
+          },
+          {
+            id: "2",
+            timeUnixNano: "1712700000000000001",
+            severityText: "ERROR",
+            body: "payment failed",
+            attributes: {},
+            resource: { serviceName: "payments", attributes: {} },
+            scope: { name: "otel" },
+          },
+        ]}
+        onInteract={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelector(".data-table__head--left-cluster-logs")).toBeTruthy();
+    expect(container.querySelector(".data-table__body-inner--logs")).toBeTruthy();
+    expect(container.querySelector(".data-table__td--timestamp .explorer-row__secondary")).toBeTruthy();
+    expect(container.querySelector(".data-table__td--service .explorer-row__secondary")).toBeTruthy();
+    expect(container.querySelector(".data-table__td--message .explorer-row__primary")).toBeTruthy();
+
+    selectFilterField("Body");
+    expect((screen.getByRole("radio", { name: "=" }) as HTMLButtonElement).classList.contains("filter-builder__operator--active")).toBe(true);
+    fireEvent.change(screen.getByLabelText("bodyContains value"), {
+      target: { value: "payment" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Apply filter" }));
+
+    await act(async () => {});
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/query/logs?filter%5BbodyContains%5D%5Beq%5D=payment", expect.any(Object));
+    expect(screen.getByText("payment failed")).toBeTruthy();
+    expect(screen.queryByText("checkout started")).toBeNull();
+  });
+
+  it("filters attribute-only events by the fallback shown in the Message column", async () => {
+    const attributeOnlyLog = {
+      id: "claude",
+      timeUnixNano: "2026-08-27T18:00:04.005Z",
+      severityText: "INFO",
+      body: "",
+      attributes: { "event.name": "api_request" },
+      resource: { serviceName: "claude-code", attributes: {} },
+      scope: { name: "com.anthropic.claude_code.events" },
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [attributeOnlyLog],
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<LogsTab logs={[attributeOnlyLog]} onInteract={vi.fn()} />);
+
+    expect(screen.getByText("api_request")).toBeTruthy();
+    selectFilterField("Message");
+    fireEvent.change(screen.getByLabelText("messageContains value"), {
+      target: { value: "api_request" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Apply filter" }));
+
+    await act(async () => {});
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/query/logs?filter%5BmessageContains%5D%5Beq%5D=api_request",
+      expect.any(Object),
+    );
+    expect(screen.getByText("api_request")).toBeTruthy();
+  });
+
+  it("renders messages and timestamps for attribute-only Codex and Claude events", () => {
+    const { container } = render(
+      <LogsTab
+        logs={[
+          {
+            id: "codex",
+            timeUnixNano: "1970-01-01T00:00:00Z",
+            severityText: "INFO",
+            body: "",
+            attributes: {
+              "event.name": "codex.turn_ttft",
+              "event.timestamp": "2026-08-27T17:27:03.227Z",
+            },
+            resource: { serviceName: "codex-app-server", attributes: {} },
+            scope: { name: "codex_otel.log_only" },
+          },
+          {
+            id: "claude",
+            timeUnixNano: "1970-01-01T00:00:00Z",
+            observedTimeUnixNano: "2026-08-27T18:00:04.005Z",
+            severityText: "INFO",
+            body: "",
+            attributes: { "event.name": "api_request" },
+            resource: { serviceName: "claude-code", attributes: {} },
+            scope: { name: "com.anthropic.claude_code.events" },
+          },
+          {
+            id: "unknown",
+            timeUnixNano: "1970-01-01T00:00:00Z",
+            severityText: "INFO",
+            body: "",
+            attributes: {},
+            resource: { serviceName: "unknown-service", attributes: {} },
+            scope: { name: "unknown" },
+          },
+        ]}
+        onInteract={vi.fn()}
+      />,
+    );
+
+    const messages = Array.from(container.querySelectorAll(".data-table__td--message"), (element) => element.textContent);
+    const timestamps = Array.from(container.querySelectorAll(".data-table__td--timestamp"), (element) => element.textContent);
+    expect(messages).toEqual(["codex.turn_ttft", "api_request", "--"]);
+    expect(timestamps).toEqual(["17:27:03.227", "18:00:04.005", "--"]);
+
+    fireEvent.click(container.querySelectorAll(".data-table__row--logs")[0] as HTMLElement);
+    expect(container.querySelector(".detail-panel__title")?.textContent).toBe("codex.turn_ttft");
+    expect(container.querySelector(".log-detail__body")?.textContent).toBe("codex.turn_ttft");
+
+    fireEvent.click(screen.getByRole("tab", { name: "JSON" }));
+    expect(container.querySelector(".log-detail__body")?.textContent).toContain('"body": ""');
+  });
+
+  it("renders positive sub-millisecond OTLP timestamps without accepting epoch placeholders", () => {
+    const { container } = render(
+      <LogsTab
+        logs={[
+          {
+            id: "numeric-nanos",
+            timeUnixNano: "1",
+            severityText: "INFO",
+            body: "numeric nanos",
+            attributes: {},
+            resource: { serviceName: "test", attributes: {} },
+            scope: { name: "test" },
+          },
+          {
+            id: "rfc3339-nanos",
+            timeUnixNano: "1970-01-01T00:00:00.000000001Z",
+            severityText: "INFO",
+            body: "RFC3339 nanos",
+            attributes: {},
+            resource: { serviceName: "test", attributes: {} },
+            scope: { name: "test" },
+          },
+          {
+            id: "epoch-placeholder",
+            timeUnixNano: "1970-01-01T00:00:00Z",
+            severityText: "INFO",
+            body: "epoch placeholder",
+            attributes: {},
+            resource: { serviceName: "test", attributes: {} },
+            scope: { name: "test" },
+          },
+        ]}
+        onInteract={vi.fn()}
+      />,
+    );
+
+    const timestamps = Array.from(
+      container.querySelectorAll(".data-table__td--timestamp"),
+      (element) => element.textContent,
+    );
+    expect(timestamps).toEqual(["00:00:00.000", "00:00:00.000", "--"]);
+  });
+
+  it("encodes negated exact filters with neq operators", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [
+        {
+          id: "2",
+          timeUnixNano: "1712700000000000001",
+          severityText: "ERROR",
+          body: "payment failed",
+          attributes: {},
+          resource: { serviceName: "payments", attributes: {} },
+          scope: { name: "otel" },
+        },
+      ],
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <LogsTab
+        logs={[
+          {
+            id: "1",
+            timeUnixNano: "1712700000000000000",
+            severityText: "INFO",
+            body: "checkout started",
+            attributes: {},
+            resource: { serviceName: "checkout", attributes: {} },
+            scope: { name: "otel" },
+          },
+          {
+            id: "2",
+            timeUnixNano: "1712700000000000001",
+            severityText: "ERROR",
+            body: "payment failed",
+            attributes: {},
+            resource: { serviceName: "payments", attributes: {} },
+            scope: { name: "otel" },
+          },
+        ]}
+        onInteract={vi.fn()}
+      />,
+    );
+
+    selectFilterField("Service");
+    fireEvent.click(screen.getByRole("radio", { name: "!=" }));
+    fireEvent.change(screen.getByLabelText("serviceName value"), {
+      target: { value: "checkout" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Apply filter" }));
+
+    await act(async () => {});
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/query/logs?filter%5BserviceName%5D%5Bneq%5D=checkout", expect.any(Object));
+    expect(screen.getByText("payment failed")).toBeTruthy();
+    expect(screen.queryByText("checkout started")).toBeNull();
+  });
+
+  it("filters by displayed severity labels such as WARN2", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [
+        {
+          id: "2",
+          timeUnixNano: "1712700000000000001",
+          severityNumber: 14,
+          body: "number only: WARN2",
+          attributes: {},
+          resource: { serviceName: "payments", attributes: {} },
+          scope: { name: "otel" },
+        },
+      ],
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <LogsTab
+        logs={[
+          {
+            id: "1",
+            timeUnixNano: "1712700000000000000",
+            severityText: "INFO",
+            body: "checkout started",
+            attributes: {},
+            resource: { serviceName: "checkout", attributes: {} },
+            scope: { name: "otel" },
+          },
+          {
+            id: "2",
+            timeUnixNano: "1712700000000000001",
+            severityNumber: 14,
+            body: "number only: WARN2",
+            attributes: {},
+            resource: { serviceName: "payments", attributes: {} },
+            scope: { name: "otel" },
+          },
+        ]}
+        onInteract={vi.fn()}
+      />,
+    );
+
+    selectFilterField("Severity");
+    fireEvent.change(screen.getByLabelText("severityDisplay value"), {
+      target: { value: "WARN2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Apply filter" }));
+
+    await act(async () => {});
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/query/logs?filter%5BseverityDisplay%5D%5Beq%5D=WARN2", expect.any(Object));
+    expect(screen.getByText("number only: WARN2")).toBeTruthy();
+    expect(screen.queryByText("checkout started")).toBeNull();
+  });
+
+  it("does not show severity number in the log filter menu", () => {
+    render(
+      <LogsTab
+        logs={[
+          {
+            id: "1",
+            timeUnixNano: "1712700000000000000",
+            severityText: "INFO",
+            body: "checkout started",
+            attributes: {},
+            resource: { serviceName: "checkout", attributes: {} },
+            scope: { name: "otel" },
+          },
+        ]}
+        onInteract={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Add filter" }));
+
+    expect(screen.queryByText("Severity Number")).toBeNull();
+  });
+
+  it("does not show time range fields in the log filter menu", () => {
+    render(
+      <LogsTab
+        logs={[
+          {
+            id: "1",
+            timeUnixNano: "1712700000000000000",
+            severityText: "INFO",
+            body: "checkout started",
+            attributes: {},
+            resource: { serviceName: "checkout", attributes: {} },
+            scope: { name: "otel" },
+          },
+        ]}
+        onInteract={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Add filter" }));
+
+    expect(screen.queryByText("Time From")).toBeNull();
+    expect(screen.queryByText("Time To")).toBeNull();
+  });
+
+  it("renders the selected log detail without validation overlays", () => {
+    const { container } = render(
+      <LogsTab
+        logs={[
+          {
+            id: "1",
+            timeUnixNano: "1712700000000000000",
+            severityText: "INFO",
+            body: "checkout started",
+            attributes: {},
+            resource: { serviceName: "checkout", attributes: {} },
+            scope: { name: "otel" },
+            traceId: "trace-1",
+            spanId: "span-1",
+          },
+        ]}
+        onInteract={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(container.querySelector(".data-table__row--logs") as HTMLElement);
+
+    expect(screen.getByRole("heading", { name: "Message" })).toBeTruthy();
+    expect(screen.queryByText("Validation")).toBeNull();
+    expect(screen.getByRole("button", { name: "Close panel" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Add filter" })).toBeTruthy();
+  });
+
+  it("falls back to severityNumber for number-only log badges and detail titles", () => {
+    const { container } = render(
+      <LogsTab
+        logs={[
+          {
+            id: "1",
+            timeUnixNano: "1712700000000000000",
+            severityNumber: 14,
+            body: "number only: WARN2",
+            attributes: {},
+            resource: { serviceName: "severity-demo", attributes: {} },
+            scope: { name: "demo.logger" },
+          },
+        ]}
+        onInteract={vi.fn()}
+      />,
+    );
+
+    const badge = container.querySelector(".data-table__td--severity") as HTMLElement;
+
+    expect(badge.textContent).toContain("WARN2");
+    expect(badge.classList.contains("sev-badge--warn")).toBe(true);
+
+    fireEvent.click(container.querySelector(".data-table__row--logs") as HTMLElement);
+
+    // Panel title shows the log message body (better UX than severity level).
+    expect(container.querySelector(".detail-panel__title")?.textContent).toBe("number only: WARN2");
+  });
+
+  it("prefers severityText over conflicting severityNumber values", () => {
+    const { container } = render(
+      <LogsTab
+        logs={[
+          {
+            id: "1",
+            timeUnixNano: "1712700000000000000",
+            severityNumber: 3,
+            severityText: "SEVERE",
+            body: "both fields: ERROR (SEVERE)",
+            attributes: {},
+            resource: { serviceName: "severity-demo", attributes: {} },
+            scope: { name: "demo.logger" },
+          },
+        ]}
+        onInteract={vi.fn()}
+      />,
+    );
+
+    const badge = container.querySelector(".data-table__td--severity") as HTMLElement;
+
+    expect(badge.textContent).toContain("SEVERE");
+    expect(badge.textContent).not.toContain("TRACE3");
+    expect(badge.classList.contains("sev-badge--error")).toBe(true);
+
+    fireEvent.click(container.querySelector(".data-table__row--logs") as HTMLElement);
+
+    // Panel title shows the log message body (better UX than severity level).
+    expect(container.querySelector(".detail-panel__title")?.textContent).toBe("both fields: ERROR (SEVERE)");
+  });
+
+  it("uses blue severity styling for info-level badges", () => {
+    const { readFileSync } = require("fs");
+    const { resolve } = require("path");
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+
+    expect(css).toContain(".sev-badge--info {\n  background: rgba(97, 202, 250, 0.18);\n  color: #61cafa;\n}");
+  });
+
+  it("severity badges use pill shape with no border-left accent", () => {
+    const { readFileSync } = require("fs");
+    const { resolve } = require("path");
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+
+    expect(css).toContain("border-radius: 999px;");
+    // No border-left on sev-badge base rule
+    const badgeBlock = css.slice(css.indexOf(".sev-badge {"), css.indexOf(".sev-badge--error {"));
+    expect(badgeBlock).not.toContain("border-left");
+  });
+
+  it("renders JSON tab with syntax-highlighted spans for key, string, number, and keyword tokens", () => {
+    const { container } = render(
+      <LogsTab
+        logs={[
+          {
+            id: "1",
+            timeUnixNano: "1712700000000000000",
+            severityText: "INFO",
+            body: "checkout started",
+            attributes: { count: 3, active: true },
+            resource: { serviceName: "checkout", attributes: {} },
+            scope: { name: "otel" },
+          },
+        ]}
+        onInteract={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(container.querySelector(".data-table__row--logs") as HTMLElement);
+
+    const jsonTab = screen.getByRole("tab", { name: "JSON" });
+    fireEvent.click(jsonTab);
+
+    // Highlighted keys
+    expect(container.querySelector(".json-hl__key")).toBeTruthy();
+    // Highlighted string values
+    expect(container.querySelector(".json-hl__string")).toBeTruthy();
+    // Highlighted numbers
+    expect(container.querySelector(".json-hl__number")).toBeTruthy();
+    // Highlighted keywords (true/false/null)
+    expect(container.querySelector(".json-hl__keyword")).toBeTruthy();
+  });
+
+  it("log detail tabs respond to ArrowRight/ArrowLeft with roving tabIndex and wraparound", () => {
+    const { container } = render(
+      <LogsTab
+        logs={[
+          {
+            id: "1",
+            timeUnixNano: "1712700000000000000",
+            severityText: "INFO",
+            body: "keyboard nav test",
+            attributes: {},
+            resource: { serviceName: "test-svc", attributes: {} },
+            scope: { name: "otel" },
+          },
+        ]}
+        onInteract={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(container.querySelector(".data-table__row--logs") as HTMLElement);
+
+    const tablist = container.querySelector('[role="tablist"][aria-label="Log detail sections"]') as HTMLElement;
+    const overviewTab = screen.getByRole("tab", { name: "Overview" });
+    const jsonTab = screen.getByRole("tab", { name: "JSON" });
+
+    expect(overviewTab.getAttribute("aria-selected")).toBe("true");
+    expect(overviewTab.getAttribute("tabindex")).toBe("0");
+    expect(jsonTab.getAttribute("tabindex")).toBe("-1");
+
+    // ArrowRight selects JSON and moves focus
+    fireEvent.keyDown(tablist, { key: "ArrowRight" });
+    expect(jsonTab.getAttribute("aria-selected")).toBe("true");
+    expect(jsonTab.getAttribute("tabindex")).toBe("0");
+    expect(overviewTab.getAttribute("tabindex")).toBe("-1");
+    expect(document.activeElement).toBe(jsonTab);
+    expect(container.querySelector('[role="tabpanel"]')?.textContent).toContain("{");
+
+    // ArrowRight wraps back to Overview and moves focus
+    fireEvent.keyDown(tablist, { key: "ArrowRight" });
+    expect(overviewTab.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(overviewTab);
+    expect(container.querySelector('[role="tabpanel"]')?.textContent).toContain("keyboard nav test");
+
+    // ArrowLeft wraps to JSON and moves focus
+    fireEvent.keyDown(tablist, { key: "ArrowLeft" });
+    expect(jsonTab.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(jsonTab);
+
+    // ArrowLeft back to Overview and moves focus
+    fireEvent.keyDown(tablist, { key: "ArrowLeft" });
+    expect(overviewTab.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(overviewTab);
+  });
+
+  it("JSON tab copy button copies raw JSON not highlighted markup", () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+
+    const log = {
+      id: "1",
+      timeUnixNano: "1712700000000000000",
+      severityText: "INFO",
+      body: "checkout started",
+      attributes: {},
+      resource: { serviceName: "checkout", attributes: {} },
+      scope: { name: "otel" },
+    };
+
+    const { container } = render(<LogsTab logs={[log]} onInteract={vi.fn()} />);
+
+    fireEvent.click(container.querySelector(".data-table__row--logs") as HTMLElement);
+    fireEvent.click(screen.getByRole("tab", { name: "JSON" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy JSON" }));
+
+    expect(writeText).toHaveBeenCalledWith(JSON.stringify(log, null, 2));
+  });
+});

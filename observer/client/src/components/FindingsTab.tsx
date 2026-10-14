@@ -1,0 +1,666 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { observerFetch } from "../host/transport";
+import type { ValidationFinding, ValidationIssue, ValidationSeverity, ValidationSummary } from "../api/types";
+import { DetailPanel, ResizablePanel, useAnimatedPanel } from "../layout";
+import {
+  filterValidationIssues,
+  issueVariantKey,
+  stableContextEntries,
+  validationSeverityRank,
+  type ValidationFilters,
+} from "../validation/utils";
+
+interface IssueVariant {
+  key: string;
+  message: string;
+  ruleId: string;
+  severity: ValidationSeverity;
+}
+
+interface SeverityTotals {
+  violation: number;
+  improvement: number;
+  information: number;
+}
+
+type ValidationSignalTab = "metric" | "span" | "log" | "resource";
+
+interface SignalTabDefinition {
+  key: ValidationSignalTab;
+  label: string;
+  issueLabel: string;
+}
+
+const signalTabs: SignalTabDefinition[] = [
+  { key: "metric", label: "Metrics", issueLabel: "Metric" },
+  { key: "span", label: "Spans", issueLabel: "Span" },
+  { key: "log", label: "Logs", issueLabel: "Example" },
+  { key: "resource", label: "Resources", issueLabel: "Attribute" },
+];
+
+interface ValidationTabProps {
+  issues: ValidationIssue[];
+  summary: ValidationSummary | null;
+}
+
+const defaultFilters: ValidationFilters = {
+  signalType: "",
+  severity: "",
+  query: "",
+};
+
+export function FindingsTab({ issues, summary }: ValidationTabProps): React.ReactElement {
+  const [filters, setFilters] = useState<ValidationFilters>(defaultFilters);
+  const [activeSignalTab, setActiveSignalTab] = useState<ValidationSignalTab>(() => firstAvailableSignal(issues));
+  const [hasExplicitSignalTabSelection, setHasExplicitSignalTabSelection] = useState(false);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [runError, setRunError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [, forceRelativeTimeRefresh] = useState(0);
+  const { exiting: panelExiting, triggerExit, cancelExit } = useAnimatedPanel();
+  const lastOpenedRowRef = useRef<HTMLElement | null>(null);
+  const signalFilteredIssues = useMemo(
+    () => filterValidationIssues(issues, { ...filters, signalType: "" }),
+    [issues, filters],
+  );
+  const signalIssueCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const tab of signalTabs) {
+      counts[tab.key] = signalFilteredIssues.filter((issue) => normalizeSignalType(issue.signalType) === tab.key).length;
+    }
+    return counts;
+  }, [signalFilteredIssues]);
+  const firstAvailableFilteredSignal = useMemo(
+    () => signalTabs.find((tab) => signalIssueCounts[tab.key] > 0)?.key ?? "metric",
+    [signalIssueCounts],
+  );
+  const activeSignalDefinition = signalTabs.find((tab) => tab.key === activeSignalTab) ?? signalTabs[0];
+
+  const filteredIssues = useMemo(
+    () => filterValidationIssues(issues, { ...filters, signalType: activeSignalTab }),
+    [issues, filters, activeSignalTab],
+  );
+  const hasResult = summary?.hasResult ?? false;
+  const isRunning = summary?.status === "running";
+  const showResultState = hasResult;
+  const completedAt = hasResult && isMeaningfulTimestamp(summary?.lastRunCompletedAt)
+    ? summary?.lastRunCompletedAt
+    : null;
+  const actionLabel = hasResult ? "Re-validate" : "Validate";
+
+  useEffect(() => {
+    if (!hasExplicitSignalTabSelection && activeSignalTab !== firstAvailableFilteredSignal) {
+      setActiveSignalTab(firstAvailableFilteredSignal);
+    }
+  }, [activeSignalTab, firstAvailableFilteredSignal, hasExplicitSignalTabSelection]);
+
+  useEffect(() => {
+    if (filteredIssues.length === 0) {
+      cancelExit();
+      setSelectedKey(null);
+      return;
+    }
+    if (selectedKey !== null && !filteredIssues.some((issue) => issue.key === selectedKey)) {
+      cancelExit();
+      setSelectedKey(null);
+    }
+  }, [filteredIssues, selectedKey, cancelExit]);
+
+  useEffect(() => {
+    if (summary?.status !== "error") {
+      setRunError(null);
+    }
+  }, [summary?.status]);
+
+  useEffect(() => {
+    const hasTimestampToRefresh = isMeaningfulTimestamp(summary?.lastRunCompletedAt)
+      || (isRunning && isMeaningfulTimestamp(summary?.lastRunStartedAt));
+    if (!hasTimestampToRefresh) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      forceRelativeTimeRefresh((tick) => tick + 1);
+    }, 1000);
+
+    return () => window.clearInterval(intervalId);
+  }, [summary?.lastRunCompletedAt, summary?.lastRunStartedAt, isRunning]);
+
+  const hasDetail = selectedKey !== null || panelExiting;
+
+  const closeIssuePanel = useCallback(() => {
+    const rowToFocus = lastOpenedRowRef.current;
+    triggerExit(() => {
+      setSelectedKey(null);
+      rowToFocus?.focus();
+    });
+  }, [triggerExit]);
+
+  const selectedIssue = useMemo(
+    () => filteredIssues.find((issue) => issue.key === selectedKey) ?? null,
+    [filteredIssues, selectedKey],
+  );
+
+  const triggerValidation = async (): Promise<void> => {
+    setIsSubmitting(true);
+    setRunError(null);
+    try {
+      const response = await observerFetch("/api/validation/run", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Obstudio-Browser-Request": "1",
+        },
+      });
+      if (!response.ok) {
+        let message = `Validation request failed with status ${response.status}`;
+        try {
+          const payload = await response.json() as { error?: string };
+          if (payload.error) {
+            message = payload.error;
+          }
+        } catch {
+          // Keep the HTTP status fallback.
+        }
+        throw new Error(message);
+      }
+    } catch (error) {
+      setRunError(error instanceof Error ? error.message : "Validation request failed");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <section id="panel-validation" className="tab-panel findings-tab" role="tabpanel" aria-label="Validation">
+      <div className={`signal-view${hasDetail ? " signal-view--with-panel" : ""}`}>
+        <div className="signal-view__content">
+          <div className="explorer__toolbar findings-tab__header">
+            <div className="findings-tab__header-meta">
+              {showResultState ? <span className="findings-tab__header-count">{filteredIssues.length} {filteredIssues.length === 1 ? "issue" : "issues"}</span> : null}
+              {showResultState && completedAt ? <span className="findings-tab__header-separator" aria-hidden="true">·</span> : null}
+              {completedAt ? (
+                <span className="findings-tab__header-timestamp" title={new Date(completedAt).toLocaleString()}>
+                  Validated {formatTimestamp(completedAt)}
+                </span>
+              ) : null}
+            </div>
+            <button
+              type="button"
+              className="findings-tab__action"
+              onClick={() => { void triggerValidation(); }}
+              disabled={isRunning || isSubmitting || !summary?.enabled}
+              title={summary?.enabled === false ? "Validator is not available — weaver binary may be missing" : undefined}
+            >
+              {isRunning || isSubmitting ? "Validating..." : actionLabel}
+            </button>
+          </div>
+
+          <div className="findings-tab__filters">
+            <select
+              aria-label="Filter by severity"
+              className="validation-panel__select"
+              value={filters.severity}
+              onChange={(event) => setFilters((current) => ({ ...current, severity: event.target.value }))}
+            >
+              <option value="">All severities</option>
+              <option value="violation">Violation</option>
+              <option value="improvement">Improvement</option>
+              <option value="information">Information</option>
+            </select>
+            <div
+              className="findings-tab__signal-tabs"
+              role="radiogroup"
+              aria-label="Validation signals"
+              onKeyDown={(event) => {
+                if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+                event.preventDefault();
+                const currentIndex = signalTabs.findIndex((t) => t.key === activeSignalTab);
+                const dir = event.key === "ArrowRight" || event.key === "ArrowDown" ? 1 : -1;
+                const nextIndex = (currentIndex + dir + signalTabs.length) % signalTabs.length;
+                setHasExplicitSignalTabSelection(true);
+                setActiveSignalTab(signalTabs[nextIndex].key);
+                (event.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]')[nextIndex])?.focus();
+              }}
+            >
+              {signalTabs.map((tab) => {
+                const count = signalIssueCounts[tab.key] ?? 0;
+                return (
+                  <button
+                    key={tab.key}
+                    type="button"
+                    role="radio"
+                    className={tab.key === activeSignalTab ? "findings-tab__signal-tab is-active" : "findings-tab__signal-tab"}
+                    aria-checked={tab.key === activeSignalTab}
+                    aria-label={formatSignalTabAriaLabel(tab.label, count)}
+                    data-has-issues={count > 0 ? "true" : "false"}
+                    tabIndex={tab.key === activeSignalTab ? 0 : -1}
+                    onClick={() => { setHasExplicitSignalTabSelection(true); setActiveSignalTab(tab.key); }}
+                  >
+                    {tab.label}
+                    {count > 0 ? <span className="findings-tab__signal-count" aria-hidden="true">{count}</span> : null}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {summary?.status === "disabled" ? (
+            <p className="explorer__status">{summary.message ?? "Validator unavailable."}</p>
+          ) : (
+            <>
+              {summary?.status === "idle" && !summary.hasResult ? (
+                <p className="explorer__status">Validation has not been run yet. Run validation to analyze the current telemetry snapshot.</p>
+              ) : null}
+              {summary?.status === "running" ? (
+                <p className="explorer__status">
+                  Validation is running{isMeaningfulTimestamp(summary?.lastRunStartedAt) ? ` since ${formatTimestamp(summary.lastRunStartedAt)}` : ""}.
+                </p>
+              ) : null}
+              {summary?.status === "error" ? (
+                <p className="explorer__status explorer__status--error">{summary.lastError ?? summary.message ?? "Validation failed."}</p>
+              ) : null}
+              {runError ? (
+                <p className="explorer__status explorer__status--error">{runError}</p>
+              ) : null}
+              {summary?.hasResult ? (
+                filteredIssues.length === 0 ? (
+                  <div className="findings-tab__empty">
+                    <p className="findings-tab__empty-title">No {activeSignalDefinition.label.toLowerCase()} validation issues match the current filters.</p>
+                  </div>
+                ) : (
+                  <div className="findings-tab__table-scroll">
+                    <div className={`data-table__head data-table__head--findings findings-tab__head`}>
+                      <span className="data-table__th">{activeSignalDefinition.issueLabel}</span>
+                      <span className="data-table__th data-table__th--numeric findings-tab__th-count">Violations</span>
+                      <span className="data-table__th data-table__th--numeric findings-tab__th-count">Improvements</span>
+                      <span className="data-table__th data-table__th--numeric findings-tab__th-count">Info</span>
+                      <span className="data-table__th">Rules</span>
+                    </div>
+                    <div className="findings-tab__list">
+                      {filteredIssues.map((issue) => {
+                        const isSelected = issue.key === selectedKey;
+                        const issueVariants = groupIssueVariants(issue.findings);
+                        const totals = issueSeverityTotals(issue, issueVariants);
+                        const ruleIds = uniqueRuleIds(issueVariants);
+                        const row = issueListRow(issue, ruleIds);
+                        return (
+                          <button
+                            key={issue.key}
+                            type="button"
+                            className={`data-table__row data-table__row--findings validation-item--${issue.severity}${isSelected ? " data-table__row--active" : ""}`}
+                            onClick={(e) => { cancelExit(); setSelectedKey(issue.key); lastOpenedRowRef.current = e.currentTarget; }}
+                            aria-pressed={isSelected && !panelExiting}
+                            aria-controls="validation-issue-detail"
+                            aria-label={formatIssueRowAriaLabel(row.issue, row.rule, totals)}
+                          >
+                            <span className="data-table__td">
+                              <span className="explorer-row__primary">{row.issue}</span>
+                            </span>
+                            <span className="data-table__td data-table__td--numeric">
+                              <span className={`explorer-row__numeric findings-tab__count--violation${totals.violation === 0 ? " is-zero" : ""}`}>{totals.violation > 0 ? totals.violation : "—"}</span>
+                            </span>
+                            <span className="data-table__td data-table__td--numeric">
+                              <span className={`explorer-row__numeric findings-tab__count--improvement${totals.improvement === 0 ? " is-zero" : ""}`}>{totals.improvement > 0 ? totals.improvement : "—"}</span>
+                            </span>
+                            <span className="data-table__td data-table__td--numeric">
+                              <span className={`explorer-row__numeric findings-tab__count--information${totals.information === 0 ? " is-zero" : ""}`}>{totals.information > 0 ? totals.information : "—"}</span>
+                            </span>
+                            <span className="data-table__td findings-tab__rule-cell">
+                              {ruleIds.length === 0 ? (
+                                <span className="explorer-row__secondary">—</span>
+                              ) : (
+                                ruleIds.map((ruleId) => (
+                                  <span key={ruleId} className="validation-item__rule-chip">{ruleId}</span>
+                                ))
+                              )}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )
+              ) : null}
+            </>
+          )}
+        </div>
+
+        {hasDetail ? (
+          <ResizablePanel
+            className={`signal-view__panel${panelExiting ? " signal-view__panel--exiting" : ""}`}
+            defaultWidth={560}
+            minWidth={360}
+            resizeLabel="Resize validation panel"
+          >
+            <aside id="validation-issue-detail" className="findings-tab__panel-shell" aria-label="Validation finding detail" aria-hidden={selectedIssue === null ? true : undefined}>
+              {selectedIssue ? (
+                <IssueDetailPanel key={selectedIssue.key} issue={selectedIssue} onClose={closeIssuePanel} />
+              ) : null}
+            </aside>
+          </ResizablePanel>
+        ) : (
+          <aside id="validation-issue-detail" hidden />
+        )}
+      </div>
+    </section>
+  );
+}
+
+function DetailRow({ label, children }: { label: string; children: React.ReactNode }): React.ReactElement {
+  return (
+    <div className="findings-tab__detail-row">
+      <dt>{label}</dt>
+      <dd>{children}</dd>
+    </div>
+  );
+}
+
+function signalTypeLabel(signalType: string): string {
+  switch (signalType) {
+    case "metric":
+      return "Metric";
+    case "log":
+      return "Log";
+    case "span":
+      return "Span";
+    case "resource":
+      return "Resource";
+    default:
+      return signalType || "Signal";
+  }
+}
+
+function groupIssueVariants(findings: ValidationFinding[]): IssueVariant[] {
+  const variants = new Map<string, IssueVariant>();
+
+  for (const finding of findings) {
+    const key = issueVariantKey(finding);
+    if (variants.has(key)) continue;
+    variants.set(key, {
+      key,
+      message: finding.message,
+      ruleId: finding.ruleId,
+      severity: finding.severity,
+    });
+  }
+
+  return Array.from(variants.values()).sort((left, right) => {
+    const severityDelta = validationSeverityRank(right.severity) - validationSeverityRank(left.severity);
+    if (severityDelta !== 0) return severityDelta;
+    const ruleDelta = left.ruleId.localeCompare(right.ruleId);
+    if (ruleDelta !== 0) return ruleDelta;
+    return left.message.localeCompare(right.message);
+  });
+}
+
+function uniqueRuleIds(variants: IssueVariant[]): string[] {
+  return Array.from(new Set(variants.map((variant) => variant.ruleId)));
+}
+
+function isGenericLogTarget(issue: ValidationIssue): boolean {
+  if (issue.signalType !== "log") return false;
+  return issue.targetLabel === "Log records" || issue.targetLabel.endsWith(" logs");
+}
+
+function issueListRow(issue: ValidationIssue, ruleIds: string[]): { issue: string; rule: string } {
+  return {
+    issue: issuePrimaryLabel(issue),
+    rule: issueRuleLabel(ruleIds),
+  };
+}
+
+function issuePrimaryLabel(issue: ValidationIssue): string {
+  switch (normalizeSignalType(issue.signalType)) {
+    case "metric":
+      return uniqueSignalValue(issue.findings, (finding) => finding.signal.metricName) || issue.targetLabel || signalTypeLabel(issue.signalType);
+    case "span":
+      return uniqueSignalValue(issue.findings, (finding) => finding.signal.spanName) || issue.targetLabel || signalTypeLabel(issue.signalType);
+    case "log":
+      return sampleLogBodies(issue.findings)[0] || issue.targetLabel || signalTypeLabel(issue.signalType);
+    case "resource":
+      return uniqueContextValue(issue.findings, "attribute_name") || issue.targetLabel || signalTypeLabel(issue.signalType);
+    default:
+      return issue.targetLabel || signalTypeLabel(issue.signalType);
+  }
+}
+
+function issueResolvedServiceLabel(issue: ValidationIssue): string | null {
+  if (issue.serviceName) {
+    return issue.serviceName;
+  }
+  return uniqueSignalValue(issue.findings, (finding) => finding.signal.serviceName);
+}
+
+function issueRuleLabel(ruleIds: string[]): string {
+  if (ruleIds.length === 0) return "—";
+  if (ruleIds.length === 1) return ruleIds[0];
+  return `${ruleIds[0]} +${ruleIds.length - 1} more`;
+}
+
+function issueSeverityTotals(issue: ValidationIssue, variants: IssueVariant[]): SeverityTotals {
+  const fallbackCounts: SeverityTotals = {
+    violation: 0,
+    improvement: 0,
+    information: 0,
+  };
+
+  for (const variant of variants) {
+    fallbackCounts[variant.severity] += 1;
+  }
+
+  return {
+    violation: issue.violationCount ?? fallbackCounts.violation,
+    improvement: issue.improvementCount ?? fallbackCounts.improvement,
+    information: issue.informationCount ?? fallbackCounts.information,
+  };
+}
+
+function sampleLogBodies(findings: ValidationFinding[]): string[] {
+  const samples = new Set<string>();
+  for (const finding of findings) {
+    const body = formatLogSample(finding.signal.logBody);
+    if (!body) continue;
+    samples.add(body);
+    if (samples.size >= 5) {
+      break;
+    }
+  }
+  return Array.from(samples);
+}
+
+function uniqueContextValue(findings: ValidationFinding[], key: string): string | null {
+  let value: string | null = null;
+  for (const finding of findings) {
+    const raw = finding.context?.[key];
+    if (raw === undefined || raw === null) {
+      continue;
+    }
+    const next = String(raw);
+    if (!next) {
+      continue;
+    }
+    if (value === null) {
+      value = next;
+      continue;
+    }
+    if (value !== next) {
+      return null;
+    }
+  }
+  return value;
+}
+
+function uniqueSignalValue(findings: ValidationFinding[], getValue: (finding: ValidationFinding) => string | undefined): string | null {
+  let value: string | null = null;
+  for (const finding of findings) {
+    const next = getValue(finding)?.trim();
+    if (!next) {
+      continue;
+    }
+    if (value === null) {
+      value = next;
+      continue;
+    }
+    if (value !== next) {
+      return null;
+    }
+  }
+  return value;
+}
+
+function firstAvailableSignal(issues: ValidationIssue[]): ValidationSignalTab {
+  for (const tab of signalTabs) {
+    if (issues.some((issue) => normalizeSignalType(issue.signalType) === tab.key)) {
+      return tab.key;
+    }
+  }
+  return "metric";
+}
+
+function normalizeSignalType(signalType: string): ValidationSignalTab | "" {
+  switch (signalType) {
+    case "metric":
+    case "span":
+    case "log":
+    case "resource":
+      return signalType;
+    default:
+      return "";
+  }
+}
+
+function formatLogSample(value: string | undefined): string {
+  const trimmed = value?.trim() ?? "";
+  if (!trimmed) return "";
+  const match = trimmed.match(/^StringValue\("(.*)"\)$/);
+  return match?.[1] ?? trimmed;
+}
+
+/** Formats a timestamp as a relative string (e.g. "2 minutes ago") with full ISO in title. */
+function formatTimestamp(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  const diffMs = Date.now() - parsed.getTime();
+  const diffSeconds = Math.floor(diffMs / 1000);
+  if (diffSeconds < 60) return "just now";
+  const diffMinutes = Math.floor(diffSeconds / 60);
+  if (diffMinutes < 60) return `${diffMinutes} ${diffMinutes === 1 ? "minute" : "minutes"} ago`;
+  const diffHours = Math.floor(diffMinutes / 60);
+  if (diffHours < 24) return `${diffHours} ${diffHours === 1 ? "hour" : "hours"} ago`;
+  return parsed.toLocaleDateString();
+}
+
+function isMeaningfulTimestamp(value: string | undefined): value is string {
+  return Boolean(value && value !== "0001-01-01T00:00:00Z");
+}
+
+function formatSignalTabAriaLabel(label: string, count: number): string {
+  if (count <= 0) return label;
+  return `${label}, ${count} ${count === 1 ? "issue" : "issues"}`;
+}
+
+function formatIssueRowAriaLabel(issue: string, rule: string, totals: SeverityTotals): string {
+  const parts: string[] = [issue, rule];
+  const counts: string[] = [];
+  if (totals.violation > 0) counts.push(`${totals.violation} ${totals.violation === 1 ? "violation" : "violations"}`);
+  if (totals.improvement > 0) counts.push(`${totals.improvement} ${totals.improvement === 1 ? "improvement" : "improvements"}`);
+  if (totals.information > 0) counts.push(`${totals.information} information ${totals.information === 1 ? "finding" : "findings"}`);
+  return [...parts, ...counts].join(", ");
+}
+
+function IssueDetailPanel({ issue, onClose }: { issue: ValidationIssue; onClose: () => void }): React.ReactElement {
+  const issueVariants = groupIssueVariants(issue.findings);
+  const groupedVariants = groupVariantsBySeverity(issueVariants);
+  const serviceLabel = issueResolvedServiceLabel(issue);
+  const showScope = Boolean(issue.scopeName) && issue.scopeName !== issue.serviceName;
+  const logSamples = issue.signalType === "log" ? sampleLogBodies(issue.findings) : [];
+  const resourceAttribute = issue.signalType === "resource" ? uniqueContextValue(issue.findings, "attribute_name") : null;
+  const resourceStability = issue.signalType === "resource" ? uniqueContextValue(issue.findings, "stability") : null;
+  const rowTitle = issuePrimaryLabel(issue);
+  const headerSubtitle = [signalTypeLabel(issue.signalType), serviceLabel].filter(Boolean).join(" · ");
+  const hasMetadata = Boolean(
+    (resourceAttribute && resourceAttribute !== rowTitle)
+    || resourceStability
+    || showScope,
+  );
+  const hasIntroSection = issue.signalType === "resource" || hasMetadata || logSamples.length > 0;
+
+  return (
+    <DetailPanel
+      title={rowTitle}
+      subtitle={headerSubtitle}
+      scrollResetKey={issue.key}
+      onClose={onClose}
+    >
+      <div className="findings-tab__detail-body">
+        {issue.signalType === "resource" ? (
+          <p className="findings-tab__detail-note">
+            Resource attributes apply across traces, metrics, and logs emitted by the same service.
+          </p>
+        ) : null}
+
+        {hasMetadata ? (
+          <dl className="findings-tab__detail-grid">
+            {resourceAttribute && resourceAttribute !== rowTitle ? <DetailRow label="Attribute">{resourceAttribute}</DetailRow> : null}
+            {resourceStability ? <DetailRow label="Stability">{resourceStability}</DetailRow> : null}
+            {showScope ? <DetailRow label="Scope">{issue.scopeName}</DetailRow> : null}
+          </dl>
+        ) : null}
+
+        {logSamples.length > 0 ? (
+          <div className="findings-tab__context">
+            <p className="findings-tab__eyebrow">Affected Logs</p>
+            <div className="findings-tab__sample-list">
+              {logSamples.map((sample) => (
+                <div key={sample} className="findings-tab__sample-item">{sample}</div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        {issueVariants.length > 0 ? (
+          <div className={hasIntroSection ? "findings-tab__context" : "findings-tab__context findings-tab__context--first"}>
+            <p className="findings-tab__eyebrow">Findings</p>
+            <div className="findings-tab__severity-groups">
+              {groupedVariants.map(({ severity, variants }) => (
+                variants.length > 0 ? (
+                  <section key={severity} className="findings-tab__severity-group">
+                    <div className="findings-tab__severity-group-header">
+                      <span className={`validation-item__severity validation-item__severity--${severity}`}>
+                        {variants.length} {severity} {variants.length === 1 ? "finding" : "findings"}
+                      </span>
+                    </div>
+                    <div className="findings-tab__variant-list">
+                      {variants.map((variant) => (
+                        <article key={variant.key} className={`validation-item validation-item--${variant.severity} validation-item--detail`}>
+                          <div className="validation-item__field validation-item__field--inline">
+                            <span className="validation-item__field-label">Rule</span>
+                            <div className="validation-item__header">
+                              <span className="validation-item__rule-chip">{variant.ruleId}</span>
+                            </div>
+                          </div>
+                          <p className="validation-item__message validation-item__message--detail">{variant.message}</p>
+                        </article>
+                      ))}
+                    </div>
+                  </section>
+                ) : null
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </DetailPanel>
+  );
+}
+
+function groupVariantsBySeverity(
+  variants: IssueVariant[],
+): Array<{ severity: ValidationSeverity; variants: IssueVariant[] }> {
+  const severities: ValidationSeverity[] = ["violation", "improvement", "information"];
+  return severities.map((severity) => ({
+    severity,
+    variants: variants.filter((variant) => variant.severity === severity),
+  }));
+}

@@ -1,0 +1,240 @@
+{
+  "schema_version": 1,
+  "kind": "rubric",
+  "mode": "with_skill",
+  "skill": "splunk-dashboard-publish",
+  "metadata": {
+    "mode": "with_skill",
+    "eval_kind": "rubric",
+    "skill": "splunk-dashboard-publish",
+    "run_id": "20260921T234133309675Z",
+    "agent_model": "gpt-5.5",
+    "judge_model": "gpt-5.5",
+    "rubric_enabled": true,
+    "runtime_enabled": false,
+    "workers": "1",
+    "config_path": "evals/codex-evals.toml"
+  },
+  "summary": {
+    "eval_count": 1,
+    "prompt_count": 1,
+    "failure_count": 0,
+    "with_skill": {
+      "prompt_count": 1,
+      "command_count": 14,
+      "duration_seconds": 241.252,
+      "agent_duration_seconds": 149.037,
+      "tokens": 320692,
+      "agent_tokens": 199435,
+      "error_count": 0,
+      "agent_usage": {
+        "provider": "codex",
+        "source": "cumulative",
+        "observed": true,
+        "usage_record_count": 1,
+        "selected_record_count": 1,
+        "input_tokens": 191894,
+        "cached_input_tokens": 163456,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 7541,
+        "reasoning_output_tokens": 4176,
+        "provider_total_tokens": null,
+        "derived_total_tokens": 199435,
+        "effective_total_tokens": 199435,
+        "coverage": {
+          "record_count": 1,
+          "modeled_count": 1,
+          "observed_count": 1,
+          "recognized_count": 1,
+          "preferred_total_count": 1,
+          "field_counts": {
+            "input_tokens": 1,
+            "cached_input_tokens": 1,
+            "cache_creation_input_tokens": 1,
+            "output_tokens": 1,
+            "reasoning_output_tokens": 1,
+            "provider_total_tokens": 0,
+            "derived_total_tokens": 1
+          }
+        }
+      },
+      "rubric": {
+        "passed": 7,
+        "total": 7,
+        "average_score": 98.0
+      },
+      "rubric_tokens": 121257,
+      "rubric_duration_seconds": 92.073,
+      "rubric_usage": {
+        "provider": "codex",
+        "source": "cumulative",
+        "observed": true,
+        "usage_record_count": 1,
+        "selected_record_count": 1,
+        "input_tokens": 116643,
+        "cached_input_tokens": 68096,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 4614,
+        "reasoning_output_tokens": 2430,
+        "provider_total_tokens": null,
+        "derived_total_tokens": 121257,
+        "effective_total_tokens": 121257,
+        "coverage": {
+          "record_count": 1,
+          "modeled_count": 1,
+          "observed_count": 1,
+          "recognized_count": 1,
+          "preferred_total_count": 1,
+          "field_counts": {
+            "input_tokens": 1,
+            "cached_input_tokens": 1,
+            "cache_creation_input_tokens": 1,
+            "output_tokens": 1,
+            "reasoning_output_tokens": 1,
+            "provider_total_tokens": 0,
+            "derived_total_tokens": 1
+          }
+        }
+      }
+    },
+    "with_baseline": null
+  },
+  "evals": [
+    {
+      "id": "dashboards/checkout-sync/qual/dashboard-publish",
+      "case": "dashboards/checkout-sync",
+      "language": "dashboards",
+      "service": "checkout-sync",
+      "prompt_count": 1,
+      "prompts": [
+        "offline-plan"
+      ],
+      "with_skill": {
+        "prompt_count": 1,
+        "command_count": 14,
+        "duration_seconds": 241.252,
+        "agent_duration_seconds": 149.037,
+        "tokens": 320692,
+        "agent_tokens": 199435,
+        "error_count": 0,
+        "agent_usage": {
+          "provider": "codex",
+          "source": "cumulative",
+          "observed": true,
+          "usage_record_count": 1,
+          "selected_record_count": 1,
+          "input_tokens": 191894,
+          "cached_input_tokens": 163456,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 7541,
+          "reasoning_output_tokens": 4176,
+          "provider_total_tokens": null,
+          "derived_total_tokens": 199435,
+          "effective_total_tokens": 199435,
+          "coverage": {
+            "record_count": 1,
+            "modeled_count": 1,
+            "observed_count": 1,
+            "recognized_count": 1,
+            "preferred_total_count": 1,
+            "field_counts": {
+              "input_tokens": 1,
+              "cached_input_tokens": 1,
+              "cache_creation_input_tokens": 1,
+              "output_tokens": 1,
+              "reasoning_output_tokens": 1,
+              "provider_total_tokens": 0,
+              "derived_total_tokens": 1
+            }
+          }
+        },
+        "rubric": {
+          "passed": 7,
+          "total": 7,
+          "average_score": 98.0
+        },
+        "rubric_tokens": 121257,
+        "rubric_duration_seconds": 92.073,
+        "rubric_usage": {
+          "provider": "codex",
+          "source": "cumulative",
+          "observed": true,
+          "usage_record_count": 1,
+          "selected_record_count": 1,
+          "input_tokens": 116643,
+          "cached_input_tokens": 68096,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 4614,
+          "reasoning_output_tokens": 2430,
+          "provider_total_tokens": null,
+          "derived_total_tokens": 121257,
+          "effective_total_tokens": 121257,
+          "coverage": {
+            "record_count": 1,
+            "modeled_count": 1,
+            "observed_count": 1,
+            "recognized_count": 1,
+            "preferred_total_count": 1,
+            "field_counts": {
+              "input_tokens": 1,
+              "cached_input_tokens": 1,
+              "cache_creation_input_tokens": 1,
+              "output_tokens": 1,
+              "reasoning_output_tokens": 1,
+              "provider_total_tokens": 0,
+              "derived_total_tokens": 1
+            }
+          }
+        }
+      },
+      "with_baseline": null,
+      "mode": "with_skill",
+      "result_paths": {
+        "eval": ".workspace/codex-evals/splunk-dashboard-publish/20260921T234133309675Z/results/dashboards/checkout-sync/qual-dashboard-publish/eval.json",
+        "with_skill": ".workspace/codex-evals/splunk-dashboard-publish/20260921T234133309675Z/results/dashboards/checkout-sync/qual-dashboard-publish/with_skill.json",
+        "with_baseline": ".workspace/codex-evals/splunk-dashboard-publish/20260921T234133309675Z/results/dashboards/checkout-sync/qual-dashboard-publish/with_baseline.json"
+      }
+    }
+  ],
+  "failures": [],
+  "source": {
+    "digest_version": 3,
+    "digest": "09daea7fa64a1c2200cff11815ebc0c09742f79805b0486e991d2ca8accc6016",
+    "eval_kinds": [
+      "rubric"
+    ],
+    "evaluator_semantics_version": 1,
+    "files": {
+      "evals/codex-evals.toml": "c0b019453c76a5b6d8692346f984ea91af04ca91331aa333b56d7a717b7b07c7",
+      "evals/dashboards/checkout-sync/dashboards.tf.seed": "ef9102bb785db77f42c07b2a35c5a8c9ed3889c2049dfc4454c6ca86b78ffe65",
+      "evals/dashboards/checkout-sync/eval/qual/dashboard-publish.json": "43b8daa3159da995acaff992efe3ba8988172f69aa8c6c93a370808d8956cf7b",
+      "evals/dashboards/checkout-sync/terraform.tfvars.seed": "5afe53a980059da0ff4fa95aa41cbe1f5a1f5460b1ab944ce7397e278f3d7c84",
+      "evals/dashboards/checkout-sync/variables.tf.seed": "82a3d17935619c370bdee88d08de50f2b8203c8c7fb5a8a150397b8b76122e6f",
+      "skills/references/consumers.json": "cd8084854d7042b7ecc306ef1efca5f1866f1616c4c0ea0f6522e4bce4efd852",
+      "skills/references/coverage-decision-tree.md": "f1b071d4d8365a98d0c21b1192a1f474d0b2944755a4b5cb51b3b5c102573ead",
+      "skills/references/full-runtime-acceptance.md": "585f42079d71460bbf7c68e4320ceabab6fcc1ba7c711948806c78c9d46736c5",
+      "skills/references/genai-readiness.md": "73e8af6407a4074ea7942df9e26be95b807e0bc69dd58e403819bc108db12209",
+      "skills/references/incident-readiness.md": "787fb441106abcb148f541befd403e5f7889a2234c6cbe590d0c6bce48a3b59a",
+      "skills/references/ledger-template.md": "0db4852ae8e977c86eb65d9ec5fd3ee0373e89bbb94d2eb4e6e88ef3909b8cbc",
+      "skills/references/report-flow-contract.md": "4d65f39dd3feac8b3fdfe5e570e7581e8705d0ce358e500aefc808023bc32dd8",
+      "skills/references/scripts/observe_report.py": "8505513574a485f39b4197ee4995449dfe1ba4cf8730a6ee34c4215e90b2711e",
+      "skills/references/signalflow-patterns.md": "4f5c853de344e6873209e9ea05eadea6449704d0592df1e911c5f396cc6394e7",
+      "skills/references/splunk-api.md": "9e1c638466c7b7ec168f68c7700821a1311e89e0db15d87bf49322d95df010cb",
+      "skills/references/terraform-normalization.md": "4e15bad3475379891075e697907e328dcf4b1c875aa0a1b6d90838c8dbbfa92a",
+      "skills/references/tests/test_observe_report.py": "2498dbfe77a969660b1212cbfa84811b5707efee779608b6d8699272a80eba1c",
+      "skills/splunk-dashboard-publish/SKILL.md": "2b7eafd8985e8b031711691a6dee14e6eac9b64dd98065103ccaeb345d982e25",
+      "skills/splunk-dashboard-publish/references/dashboard-coverage-model.md": "8538452c7dfba51693c6a36befbe74a67b0e7f677db936496a850249e18442ce"
+    },
+    "skill_path": "skills/splunk-dashboard-publish",
+    "selections": [
+      {
+        "definition_path": "evals/dashboards/checkout-sync/eval/qual/dashboard-publish.json",
+        "fixture_dir": "evals/dashboards/checkout-sync",
+        "prompt_id": "offline-plan",
+        "eval_kind": "rubric",
+        "eval_inputs": []
+      }
+    ],
+    "config_path": "evals/codex-evals.toml"
+  }
+}

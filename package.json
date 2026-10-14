@@ -1,0 +1,7 @@
+{
+  "name": "obstudio",
+  "private": true,
+  "scripts": {
+    "build": "make build && npm --prefix extension run compile"
+  }
+}

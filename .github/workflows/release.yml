@@ -1,0 +1,170 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-vsix:
+    name: Build VSIX – ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: windows-latest
+            target: win32-x64
+          - os: macos-15-intel
+            target: darwin-x64
+          - os: macos-14
+            target: darwin-arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            observer/client/package-lock.json
+            extension/package-lock.json
+
+      - name: Pin npm version
+        run: |
+          npm i -g npm@11.6.2
+          npm --version
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: observer/go.mod
+          cache-dependency-path: observer/go.sum
+
+      - name: Install extension dependencies
+        working-directory: extension
+        run: npm ci
+
+      - name: Build target VSIX package
+        working-directory: extension
+        timeout-minutes: 40
+        run: npm run build:vsix -- --target "${{ matrix.target }}"
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: observability-studio-vsix-${{ matrix.target }}
+          path: extension/*.vsix
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs: build-vsix
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            observer/client/package-lock.json
+            extension/package-lock.json
+
+      - name: Pin npm version
+        run: |
+          npm i -g npm@11.6.2
+          npm --version
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: observer/go.mod
+          cache-dependency-path: observer/go.sum
+
+      - name: Download VSIX artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: observability-studio-vsix-*
+          path: extension
+          merge-multiple: true
+
+      - name: Install extension dependencies
+        working-directory: extension
+        run: npm ci
+
+      - name: Verify Open VSX publish access
+        working-directory: extension
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          set -euo pipefail
+          : "${OVSX_PAT:?OVSX_PAT secret is not configured}"
+          ./node_modules/.bin/ovsx verify-pat Splunk
+
+      - name: Prepare release assets
+        timeout-minutes: 10
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: make release-prep
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish VSIX to Open VSX
+        working-directory: extension
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          set -euo pipefail
+          failures=0
+          ls -1 *.vsix
+          for vsix in *.vsix; do
+            echo "Publishing ${vsix} to Open VSX"
+            if ! ./node_modules/.bin/ovsx publish --skip-duplicate "${vsix}"; then
+              echo "::error::Failed to publish ${vsix} to Open VSX"
+              failures=1
+            fi
+          done
+          exit "${failures}"
+
+      - name: Marketplace manual publish reminder
+        if: ${{ success() }}
+        working-directory: extension
+        env:
+          MARKETPLACE_PUBLISHER_URL: https://marketplace.visualstudio.com/manage/publishers/Splunk
+          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          marketplace_version="$(node -e 'process.stdout.write(require("./build-vsix.js").normalizeReleaseVersion(process.env.GITHUB_REF_NAME))')"
+          {
+            echo "## Manual Visual Studio Marketplace publish required"
+            echo
+            echo "GitHub Release and Open VSX publishing completed successfully."
+            echo
+            echo "Download the four platform-specific VSIX files from [${GITHUB_REF_NAME}](${RELEASE_URL}) and upload those exact files to the [Splunk publisher](${MARKETPLACE_PUBLISHER_URL}). Do not rebuild them."
+            echo
+            echo "Verify \`Splunk.observability-studio\` version \`${marketplace_version}\` after publishing."
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "::notice title=Manual Marketplace publish required::Upload the four VSIX files from ${RELEASE_URL} to ${MARKETPLACE_PUBLISHER_URL}; do not rebuild them."
+
+  sync-plugin-manifests:
+    name: Sync plugin manifest versions
+    needs: publish-release
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: ./.github/workflows/sync-plugin-manifests.yml
+    with:
+      release_tag: ${{ github.ref_name }}

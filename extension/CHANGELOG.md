@@ -1,0 +1,30 @@
+# Change Log
+
+All notable changes to the "Splunk Observability Studio" extension will be documented in this file.
+
+## 0.0.15
+
+### Added
+- Run the extension in GitHub Copilot (VS Code) and configure its MCP integration
+
+## 0.0.14
+
+### Added
+- Run the extension in Windsurf and configure its Agent Skills and MCP integration
+
+## 0.0.13
+
+### Added
+- Run the extension in Kiro and configure its Agent Skills and MCP integration
+
+## 0.0.2 - 2026-06-23
+
+### Fixed
+- Lower minimum VS Code engine requirement from `^1.110.0` to `^1.82.0` to support a broader range of VS Code installations
+
+## 0.0.1
+
+- Start and manage a bundled local Splunk Observability Studio backend from VS Code
+- Open Splunk Observability Studio UI in a VS Code webview
+- Expose stable local OTLP endpoints for development
+- Configure MCP integration for Codex, Claude Code, and Cursor

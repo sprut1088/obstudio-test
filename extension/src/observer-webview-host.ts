@@ -1,0 +1,377 @@
+import type { IncomingMessage } from 'node:http';
+import {
+	cloudBridgeActions,
+	isSkillDocsId,
+	isSupportedFreeAccountRegion,
+	maxCloudAccessTokenBytes,
+	maxCloudDestinationBytes,
+	maxFreeAccountEmailLength,
+	maxFreeAccountFirstNameLength,
+	maxFreeAccountLastNameLength,
+	type CloudBridgeAction,
+	type SkillDocsId,
+} from './cloud-bridge';
+import { isLoopbackObserverHost } from './backend';
+
+export type ObserverHostCloudPayload = {
+	accessToken?: string;
+	adminToken?: string;
+	destination?: string;
+	email?: string;
+	enabled?: boolean;
+	expectedVersion?: string;
+	firstName?: string;
+	lastName?: string;
+	realm?: string;
+	region?: string;
+	skill?: SkillDocsId;
+	termsAccepted?: boolean;
+};
+
+export type ObserverHostRequest =
+	| {
+		body?: string;
+		kind: 'http';
+		method: 'GET' | 'POST';
+		path: string;
+	}
+	| {
+		action: CloudBridgeAction;
+		kind: 'cloud';
+		payload?: ObserverHostCloudPayload;
+	};
+
+export type ObserverHostRequestEnvelope = {
+	request: ObserverHostRequest;
+	requestId: string;
+	type: 'obstudio.host.request';
+};
+
+export type ObserverHostCancelEnvelope = {
+	requestId: string;
+	type: 'obstudio.host.cancel';
+};
+
+export type ObserverHostResponseEnvelope = {
+	code?: string;
+	error?: string;
+	ok: boolean;
+	requestId: string;
+	result?: unknown;
+	retrySafe?: boolean;
+	type: 'obstudio.host.response';
+};
+
+export type ObserverHostTelemetryEnvelope = {
+	command: 'pause' | 'resume' | 'subscribe' | 'unsubscribe';
+	type: 'obstudio.host.telemetry';
+};
+
+const maxHostRequestBodyBytes = 1 << 20;
+export const maxRemoteObserverHostResponseBytes = 16 << 20;
+export const maxLocalObserverHostResponseBytes = 64 << 20;
+const maxHostRequestPathLength = 4096;
+const requestIdPattern = /^[A-Za-z0-9_-]{8,128}$/;
+const observerStateVersionPattern = /^[A-Za-z0-9_-]{43}$/;
+const traceDetailPathPattern = /^\/api\/query\/traces\/[0-9a-fA-F]{32}$/;
+const allowedGetPaths = new Set([
+	'/api/audit/score',
+	'/api/dashboards/preview',
+	'/api/health',
+	'/api/query/logs',
+	'/api/query/logs/filter-values',
+	'/api/query/metrics',
+	'/api/query/metrics/filter-values',
+	'/api/query/stats',
+	'/api/query/stats/services',
+	'/api/query/traces',
+	'/api/query/traces/filter-values',
+	'/api/query/validation/latest',
+	'/api/query/validation/summary',
+	'/api/splunk/export',
+]);
+const allowedPostPaths = new Set(['/api/validation/run']);
+
+export function observerHostResponseByteLimit(url: URL): number {
+	return isLoopbackObserverHost(url.hostname)
+		? maxLocalObserverHostResponseBytes
+		: maxRemoteObserverHostResponseBytes;
+}
+
+export type ObserverHostHTTPResponse = {
+	body: string;
+	headers?: Record<string, string>;
+	status: number;
+	statusText: string;
+};
+
+export function collectObserverHostHTTPResponse(
+	response: IncomingMessage,
+	request: { destroy(error?: Error): void },
+	responseByteLimit: number,
+): Promise<ObserverHostHTTPResponse> {
+	return new Promise((resolve, reject) => {
+		const chunks: Buffer[] = [];
+		let settled = false;
+		let size = 0;
+		const cleanup = () => {
+			response.removeListener('data', onData);
+			response.removeListener('end', onEnd);
+			response.removeListener('aborted', onAborted);
+			response.removeListener('close', onClose);
+			// ClientRequest.destroy() can trigger a delayed response error after
+			// another event settled this promise. Retain the one-shot listener so
+			// that late stream failure cannot become an uncaught extension error.
+		};
+		const finish = (callback: () => void) => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			cleanup();
+			callback();
+		};
+		const fail = (error: Error) => finish(() => reject(error));
+		const onData = (chunk: Buffer | string) => {
+			const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+			size += buffer.length;
+			if (size > responseByteLimit) {
+				const error = new Error(
+					`Splunk Observability Studio response exceeded ${responseByteLimit / (1 << 20)} MiB.`,
+				);
+				request.destroy(error);
+				fail(error);
+				return;
+			}
+			chunks.push(buffer);
+		};
+		const onEnd = () => {
+			if (!response.complete) {
+				fail(new Error('Splunk Observability Studio response ended before the message was complete.'));
+				return;
+			}
+			const contentType = response.headers['content-type'];
+			const responseHeaders = typeof contentType === 'string'
+				? { 'content-type': contentType }
+				: undefined;
+			finish(() => resolve({
+				body: Buffer.concat(chunks).toString('utf8'),
+				headers: responseHeaders,
+				status: response.statusCode ?? 0,
+				statusText: response.statusMessage ?? '',
+			}));
+		};
+		const onError = (error: Error) => fail(error);
+		const onAborted = () => fail(new Error('Splunk Observability Studio response was aborted before completion.'));
+		const onClose = () => fail(new Error('Splunk Observability Studio response closed before completion.'));
+
+		response.on('data', onData);
+		response.once('end', onEnd);
+		response.once('error', onError);
+		response.once('aborted', onAborted);
+		response.once('close', onClose);
+	});
+}
+
+export function isObserverHostRequestEnvelope(value: unknown): value is ObserverHostRequestEnvelope {
+	if (typeof value !== 'object' || value === null) {
+		return false;
+	}
+	const envelope = value as Record<string, unknown>;
+	return envelope.type === 'obstudio.host.request'
+		&& isHostRequestId(envelope.requestId)
+		&& isObserverHostRequest(envelope.request);
+}
+
+export function isObserverHostCancelEnvelope(value: unknown): value is ObserverHostCancelEnvelope {
+	if (typeof value !== 'object' || value === null) {
+		return false;
+	}
+	const envelope = value as Record<string, unknown>;
+	return envelope.type === 'obstudio.host.cancel' && isHostRequestId(envelope.requestId);
+}
+
+export function isObserverHostTelemetryEnvelope(value: unknown): value is ObserverHostTelemetryEnvelope {
+	if (typeof value !== 'object' || value === null) {
+		return false;
+	}
+	const envelope = value as Record<string, unknown>;
+	return envelope.type === 'obstudio.host.telemetry'
+		&& typeof envelope.command === 'string'
+		&& ['pause', 'resume', 'subscribe', 'unsubscribe'].includes(envelope.command);
+}
+
+export function isAllowedObserverHostHTTPPath(method: 'GET' | 'POST', value: string): boolean {
+	if (value.length === 0 || value.length > maxHostRequestPathLength || value.includes('#')) {
+		return false;
+	}
+	let parsed: URL;
+	try {
+		parsed = new URL(value, 'http://observer.invalid');
+	} catch {
+		return false;
+	}
+	if (parsed.origin !== 'http://observer.invalid' || `${parsed.pathname}${parsed.search}` !== value) {
+		return false;
+	}
+	if (method === 'GET') {
+		return allowedGetPaths.has(parsed.pathname) || traceDetailPathPattern.test(parsed.pathname);
+	}
+	return allowedPostPaths.has(parsed.pathname);
+}
+
+function isObserverHostRequest(value: unknown): value is ObserverHostRequest {
+	if (typeof value !== 'object' || value === null) {
+		return false;
+	}
+	const request = value as Record<string, unknown>;
+	if (request.kind === 'http') {
+		return (request.method === 'GET' || request.method === 'POST')
+			&& typeof request.path === 'string'
+			&& isAllowedObserverHostHTTPPath(request.method, request.path)
+			&& (request.body === undefined
+				|| (typeof request.body === 'string'
+					&& Buffer.byteLength(request.body, 'utf8') <= maxHostRequestBodyBytes))
+			&& (request.method === 'POST' || request.body === undefined);
+	}
+	if (request.kind !== 'cloud' || !isCloudAction(request.action)) {
+		return false;
+	}
+	return isObserverHostCloudRequestPayload(request.action, request.payload);
+}
+
+function isObserverHostCloudRequestPayload(action: CloudBridgeAction, value: unknown): boolean {
+	switch (action) {
+		case 'connect':
+			return isObserverHostCloudPayload(value)
+				&& hasOnlyCloudPayloadKeys(value, ['accessToken', 'expectedVersion', 'realm'])
+				&& typeof value.accessToken === 'string'
+				&& typeof value.realm === 'string';
+		case 'resolve-realm':
+			return isObserverHostCloudPayload(value)
+				&& hasOnlyCloudPayloadKeys(value, ['destination'])
+				&& typeof value.destination === 'string'
+				&& value.destination.trim().length > 0
+				&& Buffer.byteLength(value.destination, 'utf8') <= maxCloudDestinationBytes;
+		case 'register-o11y-oauth':
+			// expectedVersion is carried opportunistically by runAction's generic
+			// versioning wrapper, same as setup-cimd/login-cimd/disconnect-cimd below --
+			// registration itself does not use it.
+			return isObserverHostCloudPayload(value)
+				&& hasOnlyCloudPayloadKeys(value, ['adminToken', 'expectedVersion', 'realm'])
+				&& typeof value.adminToken === 'string'
+				&& value.adminToken.trim().length > 0
+				&& typeof value.realm === 'string'
+				&& value.realm.trim().length > 0;
+		case 'create-free-account':
+			return isObserverHostCloudPayload(value)
+				&& hasOnlyCloudPayloadKeys(value, [
+					'email',
+					'firstName',
+					'lastName',
+					'region',
+					'termsAccepted',
+				])
+				&& typeof value.firstName === 'string'
+				&& value.firstName.length > 0
+				&& value.firstName.length <= maxFreeAccountFirstNameLength
+				&& typeof value.lastName === 'string'
+				&& value.lastName.length > 0
+				&& value.lastName.length <= maxFreeAccountLastNameLength
+				&& typeof value.email === 'string'
+				&& value.email.length > 0
+				&& value.email.length <= maxFreeAccountEmailLength
+				&& typeof value.region === 'string'
+				&& isSupportedFreeAccountRegion(value.region)
+				&& value.termsAccepted === true;
+		case 'set-enabled':
+			return isObserverHostCloudPayload(value)
+				&& hasOnlyCloudPayloadKeys(value, ['enabled', 'expectedVersion'])
+				&& typeof value.enabled === 'boolean';
+		case 'open-skill-docs':
+			return isObserverHostCloudPayload(value)
+				&& hasOnlyCloudPayloadKeys(value, ['skill'])
+				&& isSkillDocsId(value.skill);
+		case 'forget':
+			return value === undefined
+				|| (isObserverHostCloudPayload(value)
+					&& hasOnlyCloudPayloadKeys(value, ['expectedVersion']));
+		case 'disconnect-cimd':
+		case 'login-cimd':
+		case 'setup-cimd':
+			// These carry no CIMD-specific payload. A known Splunk Observability Studio state version is
+			// included when available, but initialization failures must not block a
+			// deliberate retry.
+			return value === undefined
+				|| (isObserverHostCloudPayload(value)
+					&& hasOnlyCloudPayloadKeys(value, ['expectedVersion']));
+		case 'detect-free-account-region':
+		case 'initialize':
+		case 'open-audit-report':
+		case 'open-free-edition':
+		case 'open-free-edition-terms':
+		case 'open-ingest-token-help':
+		case 'open-realm-help':
+		case 'open-observability-cloud-demo':
+		case 'open-observability-data-course':
+		case 'open-observability-docs':
+			return value === undefined;
+	}
+}
+
+function isObserverHostCloudPayload(value: unknown): value is ObserverHostCloudPayload {
+	if (typeof value !== 'object' || value === null) {
+		return false;
+	}
+	const payload = value as Record<string, unknown>;
+	return Object.keys(payload).every((key) => [
+		'accessToken',
+		'adminToken',
+		'destination',
+		'email',
+		'enabled',
+		'expectedVersion',
+		'firstName',
+		'lastName',
+		'realm',
+		'region',
+		'skill',
+		'termsAccepted',
+	].includes(key))
+		&& (payload.accessToken === undefined
+			|| (typeof payload.accessToken === 'string'
+				&& Buffer.byteLength(payload.accessToken, 'utf8') <= maxCloudAccessTokenBytes))
+		&& (payload.adminToken === undefined
+			|| (typeof payload.adminToken === 'string'
+				&& Buffer.byteLength(payload.adminToken, 'utf8') <= maxCloudAccessTokenBytes))
+		&& (payload.destination === undefined
+			|| (typeof payload.destination === 'string'
+				&& Buffer.byteLength(payload.destination, 'utf8') <= maxCloudDestinationBytes))
+		&& (payload.email === undefined || typeof payload.email === 'string')
+		&& (payload.enabled === undefined || typeof payload.enabled === 'boolean')
+		&& (payload.expectedVersion === undefined
+			|| (typeof payload.expectedVersion === 'string'
+				&& observerStateVersionPattern.test(payload.expectedVersion)))
+		&& (payload.firstName === undefined || typeof payload.firstName === 'string')
+		&& (payload.lastName === undefined || typeof payload.lastName === 'string')
+		&& (payload.realm === undefined
+			|| (typeof payload.realm === 'string' && payload.realm.length <= 32))
+		&& (payload.region === undefined || typeof payload.region === 'string')
+		&& (payload.skill === undefined || isSkillDocsId(payload.skill))
+		&& (payload.termsAccepted === undefined || typeof payload.termsAccepted === 'boolean');
+}
+
+function hasOnlyCloudPayloadKeys(
+	value: ObserverHostCloudPayload,
+	allowed: readonly string[],
+): boolean {
+	return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function isCloudAction(value: unknown): value is CloudBridgeAction {
+	return typeof value === 'string' && (cloudBridgeActions as readonly string[]).includes(value);
+}
+
+function isHostRequestId(value: unknown): value is string {
+	return typeof value === 'string' && requestIdPattern.test(value);
+}

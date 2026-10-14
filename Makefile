@@ -1,0 +1,248 @@
+BINARY     := obstudio
+GO_DIR     := observer
+GO_CMD     := ./cmd/obstudio
+GO         := go
+PYTHON     ?= python3
+GOFLAGS    ?=
+VERSION    ?= 0.1.0
+RELEASE_TAG ?=
+LDFLAGS    := -ldflags "-X main.version=$(VERSION)"
+
+BUILD_DIR  := build
+SKILLS_SRC := skills
+EVALS_DIR  := evals
+PYTEST_PLUGIN_DIR := pytest-codex-evals
+AGENT_POLICY_BASE ?=
+AGENT_POLICY_ARGS := $(if $(strip $(AGENT_POLICY_BASE)),--base-ref "$(AGENT_POLICY_BASE)",)
+
+ABS_BUILD  := $(CURDIR)/$(BUILD_DIR)
+PLUGIN_RELEASE_DIR ?= $(CURDIR)/.release/plugins
+RELEASE_WEAVER_DIR := $(CURDIR)/.release/weaver
+PLUGIN_CODEX_STAGE_DIR := $(PLUGIN_RELEASE_DIR)/obstudio-codex
+PLUGIN_CLAUDE_STAGE_DIR := $(PLUGIN_RELEASE_DIR)/obstudio-claude
+PLUGIN_VERSION = $(patsubst v%,%,$(RELEASE_TAG))
+PLUGIN_CODEX_ARCHIVE = $(PLUGIN_RELEASE_DIR)/obstudio_codex_$(PLUGIN_VERSION).zip
+PLUGIN_CLAUDE_ARCHIVE = $(PLUGIN_RELEASE_DIR)/obstudio_claude_$(PLUGIN_VERSION).zip
+RELEASE_TAG_ARG = $(if $(strip $(RELEASE_TAG)),--release-tag "$(RELEASE_TAG)",)
+
+.PHONY: help build build-client build-vsix stage-skills bundle-weaver stage-release-weaver sync-obstudio-plugin-skills check-obstudio-plugin-skills check-plugin-manifest-versions check-claude-plugin-validate stage-obstudio-plugin package-obstudio-plugin require-release-tag dev run load-severity-demo test test-extension test-client test-interactive-otel-scripts test-agent-policy agent-policy-check test-skill-description-length check-skill-description-length test-all tidy fmt vet eval-codex-home eval-codex-login eval-codex-auth eval-validation eval-validation-test eval-validation-report eval-sanity eval-sanity-test eval-sanity-report eval-sanity-ab eval-rubric eval-rubric-test eval-rubric-report eval-rubric-ab eval-runtime eval-runtime-test eval-runtime-report eval-runtime-ab eval-with-skill eval-with-baseline eval-ab eval-all eval-all-ab skill-eval skill-eval-all skill-eval-list skill-eval-ab skill-eval-ab-all test-eval-harness test-evals-all test-pytest-plugin build-pytest-plugin publish-pytest-plugin release-local release list-skills clean
+
+help: ## Show available targets
+	@grep -hE '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*## "}; {printf "  %-20s %s\n", $$1, $$2}'
+
+# --- Client build ---
+
+build-client: ## Build React client into Go static assets
+	cd $(GO_DIR)/client && npm ci
+	cd $(GO_DIR) && $(GO) run ./cmd/build-client
+
+stage-skills: ## Stage skills into observer for embedding
+	cd $(GO_DIR) && $(GO) run ./cmd/stage-skills
+
+dev: ## Watch client files and rebuild on changes (hot reload)
+	cd $(GO_DIR)/client && npm run dev
+
+# --- Go build ---
+
+bundle-weaver: ## Fetch the local Weaver validator runtime into build output
+	@mkdir -p $(BUILD_DIR)
+	cd $(GO_DIR) && $(GO) run ./cmd/fetch-weaver -output $(ABS_BUILD)
+
+stage-release-weaver: ## Fetch Weaver runtimes for all release targets
+	rm -rf "$(RELEASE_WEAVER_DIR)"
+	mkdir -p "$(RELEASE_WEAVER_DIR)"
+	cd $(GO_DIR) && $(GO) run ./cmd/fetch-weaver -all -output "$(RELEASE_WEAVER_DIR)"
+
+sync-obstudio-plugin-skills: ## Refresh committed unified plugin skills from canonical skills
+	$(PYTHON) plugins/obstudio/scripts/stage_obstudio_plugin.py --sync-plugin-skills
+
+check-obstudio-plugin-skills: ## Verify committed unified plugin skills match canonical skills
+	$(PYTHON) plugins/obstudio/scripts/stage_obstudio_plugin.py --check-plugin-skills
+
+check-plugin-manifest-versions: ## Verify plugin versions and Codex marketplace ref agree (and match RELEASE_TAG when set)
+	$(PYTHON) plugins/obstudio/scripts/stage_obstudio_plugin.py --check-manifest-versions $(RELEASE_TAG_ARG)
+
+check-claude-plugin-validate: ## Validate the obstudio plugin and root marketplace manifest with the Claude CLI
+	claude plugin validate ./plugins/obstudio --strict
+	claude plugin validate .
+
+stage-obstudio-plugin: ## Stage self-contained Codex and Claude plugin bundles
+	$(PYTHON) plugins/obstudio/scripts/stage_obstudio_plugin.py --host codex $(RELEASE_TAG_ARG) --output "$(PLUGIN_CODEX_STAGE_DIR)"
+	$(PYTHON) plugins/obstudio/scripts/stage_obstudio_plugin.py --host claude $(RELEASE_TAG_ARG) --output "$(PLUGIN_CLAUDE_STAGE_DIR)"
+
+package-obstudio-plugin: require-release-tag ## Build versioned self-contained Codex and Claude plugin zip artifacts
+	$(PYTHON) plugins/obstudio/scripts/stage_obstudio_plugin.py --host codex $(RELEASE_TAG_ARG) --output "$(PLUGIN_CODEX_STAGE_DIR)" --archive "$(PLUGIN_CODEX_ARCHIVE)"
+	$(PYTHON) plugins/obstudio/scripts/stage_obstudio_plugin.py --host claude $(RELEASE_TAG_ARG) --output "$(PLUGIN_CLAUDE_STAGE_DIR)" --archive "$(PLUGIN_CLAUDE_ARCHIVE)"
+
+build: stage-skills build-client bundle-weaver ## Build obstudio binary (client + skills embedded)
+	@mkdir -p $(BUILD_DIR)
+	cd $(GO_DIR) && $(GO) build $(GOFLAGS) $(LDFLAGS) -o $(ABS_BUILD)/$(BINARY) $(GO_CMD)
+
+build-vsix: ## Build the VS Code extension package (.vsix)
+	cd extension && npm ci
+	cd extension && npm run build:vsix
+
+run: build ## Build and run the collector
+	$(BUILD_DIR)/$(BINARY)
+
+load-severity-demo: ## Load sample logs covering severityNumber/text combinations and keep the emitter alive for manual UI testing
+	@python3 observer/load_severity_demo.py
+
+test: stage-skills ## Run all Go tests
+	cd $(GO_DIR) && $(GO) test ./...
+
+test-extension: ## Run extension unit + integration tests
+	cd extension && npm ci && npm run test:all
+
+test-client: ## Run client unit tests
+	cd $(GO_DIR)/client && npm ci && npx vitest run
+
+test-interactive-otel-scripts: ## Run interactive OTel report and selection unit tests
+	$(PYTHON) -m unittest discover -s skills/references/tests -p 'test_*.py'
+	$(PYTHON) -m unittest discover -s skills/otel-audit/tests -p 'test_*.py'
+	$(PYTHON) -m unittest discover -s skills/otel-instrument/tests -p 'test_*.py'
+	$(PYTHON) -m unittest discover -s skills/otel-verify/tests -p 'test_*.py'
+	$(MAKE) -C $(EVALS_DIR) test-interactive-guidance
+
+test-agent-policy: ## Run deterministic agent-policy and guideline contract tests
+	$(PYTHON) -m unittest discover -s tests -p 'test_agent_policy.py'
+	$(PYTHON) evals/test_agent_guideline_contracts.py
+
+agent-policy-check: test-agent-policy ## Validate agent instructions and repository-policy contracts
+	$(PYTHON) scripts/check_agent_policy.py $(AGENT_POLICY_ARGS)
+
+test-skill-description-length: ## Run unit tests for the skill description length checker
+	$(PYTHON) -m unittest discover -s tests -p 'test_skill_description_length.py'
+
+check-skill-description-length: test-skill-description-length ## Verify canonical SKILL.md descriptions stay within the 1,536 character cap
+	$(PYTHON) scripts/check_skill_description_length.py
+
+test-all: ## Run all tests (Go + client + extension + interactive OTel scripts)
+	$(MAKE) test
+	$(MAKE) test-client
+	$(MAKE) test-extension
+	$(MAKE) test-interactive-otel-scripts
+
+tidy: ## Tidy Go modules
+	cd $(GO_DIR) && $(GO) mod tidy
+
+fmt: ## Format Go source
+	cd $(GO_DIR) && $(GO) fmt ./...
+
+vet: stage-skills ## Vet Go source
+	cd $(GO_DIR) && $(GO) vet ./...
+
+lint: stage-skills ## Run golangci-lint (requires golangci-lint on PATH)
+	cd $(GO_DIR) && golangci-lint run ./...
+
+# --- Release ---
+
+require-release-tag:
+	@test -n "$(RELEASE_TAG)" || { echo "RELEASE_TAG is required (for example, v0.2.0)"; exit 2; }
+
+release-prep: require-release-tag check-obstudio-plugin-skills stage-skills build-client stage-release-weaver package-obstudio-plugin ## Prepare assets for GoReleaser and plugin publishing
+
+release-local: RELEASE_TAG = v$(VERSION)
+release-local: release-prep ## Build release archives locally via GoReleaser (snapshot, no publish)
+	goreleaser release --snapshot --clean
+
+release: release-prep ## Build and publish a release via GoReleaser (requires GITHUB_TOKEN)
+	goreleaser release --clean
+
+# --- Skill evals ---
+
+eval-codex-home eval-codex-login eval-codex-auth:
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-validation: ## Validate eval JSONs, eval directories, and skill sources
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-validation-test eval-validation-report:
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-sanity: ## Run quick loaded-skill sanity checks; pass AB=1 or WITH=ab to include baseline
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-sanity-test eval-sanity-report:
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-sanity-ab: ## Run sanity checks with baseline
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-rubric: ## Run schema-constrained rubric grading; pass AB=1 or WITH=ab to include baseline
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-rubric-test eval-rubric-report:
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-rubric-ab: ## Run rubric grading with baseline
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-runtime: ## Run Docker/Splunk Observability Studio runtime checks; pass AB=1 or WITH=ab to include baseline
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-runtime-test eval-runtime-report:
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-runtime-ab: ## Run runtime checks with baseline
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-with-skill: ## Run Codex with the skill loaded, then grade checks
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-with-baseline: ## Run Codex baseline with no skill loaded, then grade checks
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-ab: ## Run Codex with_skill and with_baseline sides in one A/B comparison
+	$(MAKE) -C $(EVALS_DIR) $@
+
+skill-eval: ## Alias for eval-with-skill
+	$(MAKE) -C $(EVALS_DIR) $@
+
+skill-eval-all: ## Alias for eval-with-skill
+	$(MAKE) -C $(EVALS_DIR) $@
+
+skill-eval-list: ## List discovered Codex skill evals
+	$(MAKE) -C $(EVALS_DIR) $@
+
+skill-eval-ab: ## Alias for eval-ab
+	$(MAKE) -C $(EVALS_DIR) $@
+
+skill-eval-ab-all: ## Alias for eval-ab
+	$(MAKE) -C $(EVALS_DIR) $@
+
+test-eval-harness: ## Run fast unit tests for the Codex eval harness
+	$(MAKE) -C $(EVALS_DIR) $@
+
+eval-all: ## Run validation, sanity, rubric, and runtime evals
+	@$(MAKE) -C $(EVALS_DIR) eval-all
+
+eval-all-ab: ## Run validation plus A/B sanity, rubric, and runtime evals
+	@$(MAKE) -C $(EVALS_DIR) eval-all-ab
+
+test-evals-all: eval-all ## Alias for eval-all
+
+test-pytest-plugin: ## Run pytest plugin unit tests
+	$(MAKE) -C $(PYTEST_PLUGIN_DIR) test
+
+build-pytest-plugin: ## Build pytest plugin distribution artifacts
+	$(MAKE) -C $(PYTEST_PLUGIN_DIR) build
+
+publish-pytest-plugin: ## Publish pytest plugin distribution artifacts (requires uv publish credentials)
+	$(MAKE) -C $(PYTEST_PLUGIN_DIR) publish
+
+# --- Skills ---
+
+list-skills: ## List available skills in this repo
+	@echo "Available skills:"
+	@find "$(SKILLS_SRC)" -name SKILL.md | sort | while read skillfile; do \
+		name=$$(head -5 "$$skillfile" | grep '^name:' | sed 's/^name:[[:space:]]*//'); \
+		desc=$$(awk '/^description:/{found=1; sub(/^description:[[:space:]]*>*-*[[:space:]]*/,""); if(length>0) print; next} found && /^[[:space:]]/{sub(/^[[:space:]]*/,""); print; next} found{exit}' "$$skillfile" | tr '\n' ' '); \
+		printf "  %-20s %s\n" "$$name" "$$desc"; \
+	done
+
+# --- Clean ---
+
+clean: ## Remove build artifacts
+	rm -rf "$(BUILD_DIR)" .release dist $(GO_DIR)/cmd/obstudio/_skills $(GO_DIR)/internal/web/static/assets $(GO_DIR)/client/public/assets

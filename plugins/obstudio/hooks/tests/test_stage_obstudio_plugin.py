@@ -1,0 +1,563 @@
+import importlib.util
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+from unittest import mock
+
+
+def load_stage_module():
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "stage_obstudio_plugin.py"
+    spec = importlib.util.spec_from_file_location("stage_obstudio_plugin", script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+STAGE = load_stage_module()
+
+
+class StageObstudioPluginTest(unittest.TestCase):
+    def test_stage_materializes_unified_plugin(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            output = Path(tempdir) / "obstudio"
+
+            STAGE.stage_plugin(output)
+
+            self.assertTrue((output / ".codex-plugin" / "plugin.json").is_file())
+            self.assertTrue((output / ".claude-plugin" / "plugin.json").is_file())
+            self.assertTrue((output / "LICENSE").is_file())
+            self.assertTrue((output / "PRIVACY.md").is_file())
+            self.assertTrue((output / "SECURITY.md").is_file())
+            self.assertTrue((output / "hooks" / "bootstrap_obstudio.py").is_file())
+            self.assertTrue((output / "hooks" / "bootstrap_claude.cjs").is_file())
+            self.assertTrue((output / "skills" / "connect-splunk-observability-cloud" / "SKILL.md").is_file())
+            self.assertTrue((output / "skills" / "create-splunk-free-account" / "SKILL.md").is_file())
+            self.assertTrue((output / "skills" / "otel-instrument" / "SKILL.md").is_file())
+            self.assertTrue((output / "skills" / "references" / "report-flow-contract.md").is_file())
+            self.assertFalse((output / "skills" / "otel-instrument").is_symlink())
+            self.assertFalse(any(path.is_symlink() for path in output.rglob("*")))
+
+    def test_staged_plugin_excludes_skill_tests_and_caches(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            output = Path(tempdir) / "obstudio"
+            canonical_skills = Path(tempdir) / "skills"
+            shutil.copytree(STAGE.CANONICAL_SKILLS_ROOT, canonical_skills)
+            for cache_name in (".pytest_cache", ".mypy_cache", ".ruff_cache"):
+                cache_file = canonical_skills / "otel-instrument" / cache_name / "cache" / "entry"
+                cache_file.parent.mkdir(parents=True)
+                cache_file.write_text("cache", encoding="utf-8")
+
+            with mock.patch.object(STAGE, "CANONICAL_SKILLS_ROOT", canonical_skills):
+                STAGE.stage_plugin(output)
+
+            skill_files = [path for path in (output / "skills").rglob("*") if path.is_file()]
+            self.assertTrue((output / "skills" / "otel-instrument" / "scripts" / "validate_gap_closure.py").is_file())
+            self.assertFalse(any(path.name == "tests" or "tests" in path.parts for path in skill_files))
+            self.assertFalse(any(path.name.startswith("test_") for path in skill_files))
+            self.assertFalse(
+                any(
+                    cache_name in path.parts
+                    for path in skill_files
+                    for cache_name in (".pytest_cache", ".mypy_cache", ".ruff_cache")
+                )
+            )
+
+    def test_host_stage_omits_other_host_metadata(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            output = Path(tempdir) / "obstudio-codex"
+
+            STAGE.stage_plugin(output, host="codex")
+
+            self.assertTrue((output / ".codex-plugin" / "plugin.json").is_file())
+            self.assertFalse((output / ".claude-plugin").exists())
+            self.assertTrue((output / "hooks" / "codex-hooks.json").is_file())
+            self.assertFalse((output / "hooks" / "claude-hooks.json").exists())
+            self.assertFalse((output / "hooks" / "bootstrap_claude.cjs").exists())
+
+    def test_claude_stage_preserves_source_manifest_version(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            output = Path(tempdir) / "obstudio-claude"
+            plugin_root = Path(__file__).resolve().parents[2]
+            source_manifest = json.loads(
+                (plugin_root / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+            )
+
+            STAGE.stage_plugin(output, host="claude")
+
+            manifest = json.loads((output / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["version"], source_manifest["version"])
+
+    def test_release_tag_stamps_and_enforces_both_plugin_manifest_versions(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            output = Path(tempdir) / "obstudio"
+
+            STAGE.stage_plugin(output, host="all", release_version=STAGE.release_version_from_tag("v1.2.3"))
+
+            for manifest_path in (
+                output / ".codex-plugin" / "plugin.json",
+                output / ".claude-plugin" / "plugin.json",
+            ):
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(manifest["version"], "1.2.3")
+            STAGE.verify_staged_plugin(output, host="all", expected_version="1.2.3")
+
+    def test_release_tag_rejects_non_semver_or_missing_v_prefix(self):
+        for tag in ("1.2.3", "vlatest", "v1.2", "v01.2.3", "v1.2.3-01", "v1.2.3-rc..1"):
+            with self.assertRaisesRegex(RuntimeError, "release tag must be"):
+                STAGE.release_version_from_tag(tag)
+
+    def test_release_tag_accepts_semver_prerelease_and_build_metadata(self):
+        self.assertEqual(STAGE.release_version_from_tag("v1.2.3-rc.1+build.42"), "1.2.3-rc.1+build.42")
+
+    def test_sync_claude_marketplace_pins_release_archive_and_checksum(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            marketplace_path = root / "marketplace.json"
+            checksums_path = root / "checksums.txt"
+            marketplace_path.write_text(
+                json.dumps(
+                    {
+                        "name": "obstudio",
+                        "plugins": [{"name": "obstudio", "source": "./plugins/obstudio"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            digest = "a" * 64
+            checksums_path.write_text(
+                f"{'c' * 64}  obstudio_1.2.3_linux_amd64.zip\n"
+                f"{digest}  obstudio_claude_1.2.3.zip\n"
+                f"{'b' * 64}  obstudio_codex_1.2.3.zip\n"
+                f"{'d' * 64}  splunk.observability-studio-1.2.3-linux-x64.vsix\n",
+                encoding="utf-8",
+            )
+
+            STAGE.sync_claude_marketplace("v1.2.3", checksums_path, marketplace_path)
+
+            marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+            source = marketplace["plugins"][0]["source"]
+            self.assertEqual(source["source"], "archive")
+            self.assertEqual(
+                source["url"],
+                "https://github.com/signalfx/obstudio/releases/download/v1.2.3/obstudio_claude_1.2.3.zip",
+            )
+            self.assertEqual(source["sha256"], digest)
+
+    def test_sync_claude_marketplace_requires_exact_archive_checksum(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            checksums_path = root / "checksums.txt"
+            checksums_path.write_text(f"{'a' * 64} *obstudio_codex_1.2.3.zip\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "checksum for obstudio_claude_1.2.3.zip"):
+                STAGE.checksum_for_archive(checksums_path, "obstudio_claude_1.2.3.zip")
+
+    def test_sync_codex_marketplace_pins_git_subdir_to_release_tag(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            marketplace_path = Path(tempdir) / "marketplace.json"
+            marketplace_path.write_text(
+                json.dumps(
+                    {
+                        "name": "obstudio",
+                        "plugins": [{"name": "obstudio", "source": {"source": "local"}}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            STAGE.sync_codex_marketplace("v1.2.3", marketplace_path)
+
+            marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+            source = marketplace["plugins"][0]["source"]
+            self.assertEqual(
+                source,
+                {
+                    "source": "git-subdir",
+                    "url": "https://github.com/signalfx/obstudio.git",
+                    "path": "./plugins/obstudio",
+                    "ref": "v1.2.3",
+                },
+            )
+
+    def test_sync_codex_marketplace_rejects_invalid_release_tag(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            marketplace_path = Path(tempdir) / "marketplace.json"
+            marketplace_path.write_text(
+                json.dumps({"plugins": [{"name": "obstudio"}]}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "release tag must be"):
+                STAGE.sync_codex_marketplace("latest", marketplace_path)
+
+    def test_check_codex_marketplace_ref_requires_release_tag_and_source(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            marketplace_path = Path(tempdir) / "marketplace.json"
+            marketplace_path.write_text(
+                json.dumps(
+                    {
+                        "plugins": [
+                            {
+                                "name": "obstudio",
+                                "source": {
+                                    "source": "git-subdir",
+                                    "url": "https://github.com/signalfx/obstudio.git",
+                                    "path": "./plugins/obstudio",
+                                    "ref": "v1.2.3",
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            STAGE.check_codex_marketplace_ref("1.2.3", marketplace_path)
+            with self.assertRaisesRegex(RuntimeError, "Codex marketplace source must match"):
+                STAGE.check_codex_marketplace_ref("1.2.4", marketplace_path)
+
+    def test_package_target_requires_tag_and_stamps_versioned_archives(self):
+        root = Path(__file__).resolve().parents[4]
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            release_dir = Path(tempdir) / "plugins"
+            make_base = ["make", "--no-print-directory", "package-obstudio-plugin"]
+            output_override = f"PLUGIN_RELEASE_DIR={release_dir}"
+
+            missing_tag = subprocess.run(
+                [*make_base, output_override],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(missing_tag.returncode, 0)
+            self.assertIn("RELEASE_TAG is required", missing_tag.stderr + missing_tag.stdout)
+
+            packaged = subprocess.run(
+                [*make_base, "RELEASE_TAG=v1.2.3", output_override],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(packaged.returncode, 0, packaged.stdout + packaged.stderr)
+
+            for host, manifest_dir in (("codex", ".codex-plugin"), ("claude", ".claude-plugin")):
+                archive = release_dir / f"obstudio_{host}_1.2.3.zip"
+                self.assertTrue(archive.is_file(), packaged.stdout + packaged.stderr)
+
+                with zipfile.ZipFile(archive) as zip_file:
+                    manifest_name = next(
+                        name for name in zip_file.namelist() if name.endswith(f"{manifest_dir}/plugin.json")
+                    )
+                    manifest = json.loads(zip_file.read(manifest_name))
+
+                self.assertEqual(manifest["version"], "1.2.3")
+
+    def test_release_tag_verification_rejects_manifest_version_mismatch(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            output = Path(tempdir) / "obstudio-claude"
+            STAGE.stage_plugin(output, host="claude")
+
+            with self.assertRaisesRegex(RuntimeError, "must match release version 1.2.3"):
+                STAGE.verify_staged_plugin(output, host="claude", expected_version="1.2.3")
+
+    def test_bump_committed_manifest_versions_updates_both_hosts(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            plugin_root = Path(tempdir) / "obstudio"
+            for manifest_dir in (".claude-plugin", ".codex-plugin"):
+                (plugin_root / manifest_dir).mkdir(parents=True)
+                (plugin_root / manifest_dir / "plugin.json").write_text(
+                    '{\n  "name": "obstudio",\n  "version": "0.0.16",\n  "skills": ["./skills/"]\n}\n',
+                    encoding="utf-8",
+                )
+
+            updated = STAGE.bump_committed_manifest_versions("1.2.3", plugin_root=plugin_root)
+
+            self.assertEqual(len(updated), 2)
+            for manifest_dir in (".claude-plugin", ".codex-plugin"):
+                manifest_path = plugin_root / manifest_dir / "plugin.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(manifest["version"], "1.2.3")
+                self.assertEqual(
+                    manifest_path.read_text(encoding="utf-8"),
+                    '{\n  "name": "obstudio",\n  "version": "1.2.3",\n  "skills": ["./skills/"]\n}\n',
+                )
+
+    def _write_plugin_root(self, tempdir, claude_version, codex_version):
+        plugin_root = Path(tempdir) / "obstudio"
+        for manifest_dir, version in ((".claude-plugin", claude_version), (".codex-plugin", codex_version)):
+            (plugin_root / manifest_dir).mkdir(parents=True)
+            (plugin_root / manifest_dir / "plugin.json").write_text(
+                json.dumps({"name": "obstudio", "version": version, "skills": ["./skills/"]}),
+                encoding="utf-8",
+            )
+        return plugin_root
+
+    def test_check_committed_manifest_versions_accepts_matching_versions(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            plugin_root = self._write_plugin_root(tempdir, "1.2.3", "1.2.3")
+            STAGE.check_committed_manifest_versions(plugin_root=plugin_root)
+
+    def test_check_committed_manifest_versions_rejects_mismatched_hosts(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            plugin_root = self._write_plugin_root(tempdir, "1.2.3", "1.2.4")
+            with self.assertRaisesRegex(RuntimeError, "plugin manifest versions disagree"):
+                STAGE.check_committed_manifest_versions(plugin_root=plugin_root)
+
+    def test_check_committed_manifest_versions_accepts_matching_release_tag(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            plugin_root = self._write_plugin_root(tempdir, "1.2.3", "1.2.3")
+            STAGE.check_committed_manifest_versions("v1.2.3", plugin_root=plugin_root)
+
+    def test_check_committed_manifest_versions_rejects_release_tag_mismatch(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            plugin_root = self._write_plugin_root(tempdir, "1.2.3", "1.2.3")
+            with self.assertRaisesRegex(RuntimeError, "does not match release tag"):
+                STAGE.check_committed_manifest_versions("v9.9.9", plugin_root=plugin_root)
+
+    def test_cli_check_manifest_versions_routes_release_tag(self):
+        with mock.patch.object(
+            sys, "argv", ["stage_obstudio_plugin.py", "--check-manifest-versions", "--release-tag", "v1.2.3"]
+        ):
+            with mock.patch.object(STAGE, "check_committed_manifest_versions") as check:
+                self.assertEqual(STAGE.main(), 0)
+
+        check.assert_called_once_with("v1.2.3")
+
+    def test_cli_bump_manifests_routes_release_tag(self):
+        with mock.patch.object(sys, "argv", ["stage_obstudio_plugin.py", "--bump-manifests", "--release-tag", "v1.2.3"]):
+            with mock.patch.object(STAGE, "bump_committed_manifest_versions") as bump:
+                self.assertEqual(STAGE.main(), 0)
+
+        bump.assert_called_once_with("1.2.3")
+
+    def test_cli_bump_manifests_requires_release_tag(self):
+        with mock.patch.object(sys, "argv", ["stage_obstudio_plugin.py", "--bump-manifests"]):
+            with self.assertRaisesRegex(RuntimeError, "--release-tag is required with --bump-manifests"):
+                STAGE.main()
+
+    def test_verify_rejects_staged_symlinks(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            output = Path(tempdir) / "obstudio"
+            (output / ".codex-plugin").mkdir(parents=True)
+            (output / ".codex-plugin" / "plugin.json").write_text(
+                json.dumps({"interface": {"defaultPrompt": []}}),
+                encoding="utf-8",
+            )
+            (output / "skills").mkdir()
+            (output / "target").write_text("target", encoding="utf-8")
+            (output / "skills" / "linked").symlink_to(output / "target")
+
+            with self.assertRaisesRegex(RuntimeError, "must not contain symlinks"):
+                STAGE.verify_staged_plugin(output)
+
+    def test_codex_marketplace_pins_release_tag_and_plugin_subdirectory(self):
+        marketplace_path = Path(__file__).resolve().parents[4] / ".agents" / "plugins" / "marketplace.json"
+        marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+        plugin_manifest_path = (
+            Path(__file__).resolve().parents[4]
+            / "plugins"
+            / "obstudio"
+            / ".codex-plugin"
+            / "plugin.json"
+        )
+        plugin_manifest = json.loads(plugin_manifest_path.read_text(encoding="utf-8"))
+        source = marketplace["plugins"][0]["source"]
+
+        self.assertEqual(source["source"], "git-subdir")
+        self.assertEqual(source["url"], "https://github.com/signalfx/obstudio.git")
+        self.assertEqual(source["path"], "./plugins/obstudio")
+        self.assertEqual(source["ref"], f"v{plugin_manifest['version']}")
+        self.assertEqual(marketplace["interface"]["displayName"], "Splunk Observability Studio")
+        self.assertEqual(marketplace["plugins"][0]["name"], "obstudio")
+
+    def test_claude_marketplace_uses_legacy_compatible_metadata(self):
+        repo_root = Path(__file__).resolve().parents[4]
+        marketplace_path = repo_root / ".claude-plugin" / "marketplace.json"
+        marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+        plugin_manifest = json.loads(
+            (repo_root / "plugins" / "obstudio" / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+        )
+        plugin_version = plugin_manifest["version"]
+        source = marketplace["plugins"][0]["source"]
+
+        # Top-level `description` is an optional, officially supported marketplace.json
+        # field (claude plugin validate has accepted it since Claude Code v2.1.120).
+        self.assertIn("Splunk Observability Studio", marketplace["description"])
+        self.assertEqual(marketplace["name"], "obstudio")
+        self.assertEqual(marketplace["plugins"][0]["name"], "obstudio")
+        self.assertEqual(marketplace["plugins"][0]["displayName"], "Splunk Observability Studio")
+        self.assertEqual(source["source"], "archive")
+        self.assertEqual(
+            source["url"],
+            f"https://github.com/signalfx/obstudio/releases/download/v{plugin_version}/"
+            f"obstudio_claude_{plugin_version}.zip",
+        )
+        self.assertRegex(source["sha256"], r"\A[0-9a-f]{64}\Z")
+        self.assertIn("Splunk Observability Studio", marketplace["plugins"][0]["description"])
+        self.assertNotIn("observer controls", marketplace["plugins"][0]["description"].lower())
+        self.assertEqual(
+            set(marketplace["plugins"][0]),
+            {"name", "displayName", "source", "description"},
+        )
+
+    def test_plugin_manifest_uses_committed_skills(self):
+        plugin_root = Path(__file__).resolve().parents[2]
+        manifest_path = plugin_root / ".codex-plugin" / "plugin.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        skills_path = plugin_root / manifest["skills"]
+
+        self.assertEqual(manifest["skills"], "./skills/")
+        self.assertLessEqual(
+            len(manifest["interface"]["defaultPrompt"]),
+            STAGE.MAX_DEFAULT_PROMPTS,
+        )
+        self.assertTrue((skills_path / "otel-instrument" / "SKILL.md").is_file())
+        self.assertTrue((skills_path / "connect-splunk-observability-cloud" / "SKILL.md").is_file())
+        self.assertTrue((skills_path / "create-splunk-free-account" / "SKILL.md").is_file())
+        self.assertFalse(any(path.is_symlink() for path in skills_path.rglob("*")))
+
+    def test_host_manifests_explicitly_select_hook_files(self):
+        plugin_root = Path(__file__).resolve().parents[2]
+        codex_manifest = json.loads((plugin_root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        claude_manifest = json.loads((plugin_root / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(codex_manifest["hooks"], "./hooks/codex-hooks.json")
+        self.assertEqual(codex_manifest["name"], "obstudio")
+        self.assertEqual(codex_manifest["interface"]["displayName"], "Splunk Observability Studio")
+        self.assertIn("Splunk Observability Studio", codex_manifest["description"])
+        self.assertNotIn("observer controls", codex_manifest["description"].lower())
+        self.assertEqual(claude_manifest["hooks"], "./hooks/claude-hooks.json")
+        self.assertEqual(claude_manifest["name"], "obstudio")
+        self.assertIn("Splunk Observability Studio", claude_manifest["description"])
+        self.assertNotIn("observer controls", claude_manifest["description"].lower())
+        self.assertNotIn("$schema", claude_manifest)
+        self.assertEqual(claude_manifest["displayName"], "Splunk Observability Studio")
+
+        codex_hook = json.loads((plugin_root / "hooks" / "codex-hooks.json").read_text(encoding="utf-8"))
+        codex_command = codex_hook["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        self.assertIn("OBSTUDIO_PLUGIN_HOST=codex", codex_command)
+        self.assertEqual(
+            codex_hook["hooks"]["SessionStart"][0]["hooks"][0]["statusMessage"],
+            "Bootstrapping Splunk Observability Studio for Codex",
+        )
+
+        claude_hook = json.loads((plugin_root / "hooks" / "claude-hooks.json").read_text(encoding="utf-8"))
+        claude_command = claude_hook["hooks"]["SessionStart"][0]["hooks"][0]
+        self.assertEqual(
+            claude_command["command"],
+            'node "${CLAUDE_PLUGIN_ROOT}/hooks/bootstrap_claude.cjs"',
+        )
+        self.assertNotIn("args", claude_command)
+        self.assertEqual(claude_command["statusMessage"], "Bootstrapping Splunk Observability Studio for Claude Code")
+        self.assertNotIn("commandWindows", claude_command)
+
+        claude_launcher = (plugin_root / "hooks" / "bootstrap_claude.cjs").read_text(encoding="utf-8")
+        self.assertLess(claude_launcher.index('["py", ["-3"]]'), claude_launcher.index('["python", []]'))
+
+    def test_verify_rejects_too_many_default_prompts(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            output = Path(tempdir) / "obstudio"
+            (output / ".codex-plugin").mkdir(parents=True)
+            (output / "skills").mkdir(parents=True)
+            (output / ".codex-plugin" / "plugin.json").write_text(
+                json.dumps(
+                    {
+                        "interface": {
+                            "defaultPrompt": [
+                                "one",
+                                "two",
+                                "three",
+                                "four",
+                            ],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "defaultPrompt must contain at most 3 entries"):
+                STAGE.verify_staged_plugin(output)
+
+    def test_verify_rejects_unknown_manifest_skill_references(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            output = Path(tempdir) / "obstudio"
+            (output / ".codex-plugin").mkdir(parents=True)
+            skill_dir = output / "skills" / "observer-control" / "observer-open"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: observer-open\n---\n",
+                encoding="utf-8",
+            )
+            (output / ".codex-plugin" / "plugin.json").write_text(
+                json.dumps(
+                    {
+                        "interface": {
+                            "longDescription": "Open with $open-observer.",
+                            "defaultPrompt": [],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, r"unknown skills: \$open-observer"):
+                STAGE.verify_staged_plugin(output)
+
+    def test_committed_plugin_skills_are_synced(self):
+        STAGE.verify_plugin_skills_synced()
+
+    def test_normalized_hash_ignores_trailing_line_whitespace(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            source = Path(tempdir) / "source.md"
+            destination = Path(tempdir) / "destination.md"
+            source.write_text("same text \nnext\t\r\nlast ", encoding="utf-8")
+            destination.write_text("same text\nnext\r\nlast", encoding="utf-8")
+
+            self.assertEqual(
+                STAGE.normalized_file_sha256(source),
+                STAGE.normalized_file_sha256(destination),
+            )
+
+    def test_archive_orders_skills_by_trust_group(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            output = Path(tempdir) / "obstudio"
+            archive = Path(tempdir) / "obstudio.zip"
+
+            STAGE.stage_plugin(output)
+            STAGE.write_archive(output, archive)
+
+            with zipfile.ZipFile(archive) as zf:
+                skill_dirs = []
+                seen = set()
+                for name in zf.namelist():
+                    parts = name.split("/")
+                    if len(parts) < 3 or parts[0] != "obstudio" or parts[1] != "skills":
+                        continue
+                    if parts[2] == "observer-control" and len(parts) >= 4:
+                        skill = "/".join(parts[2:4])
+                    else:
+                        skill = parts[2]
+                    if skill not in seen:
+                        seen.add(skill)
+                        skill_dirs.append(skill)
+
+            self.assertEqual(
+                skill_dirs[: len(STAGE.PLUGIN_SKILL_ENTRIES)],
+                list(STAGE.PLUGIN_SKILL_ENTRIES),
+            )
+
+    def test_plugin_local_observer_control_skills_are_not_shared(self):
+        root = Path(__file__).resolve().parents[4]
+
+        self.assertFalse((root / "skills" / "observer-control").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,26 @@
+{
+  "skill": "otel-audit",
+  "prompts": [
+    {
+      "id": "direct",
+      "task": "Scan the Java Spring Boot service in ./service for observability gaps. Do not modify service code, dependencies, configuration, or tests. Only the required .observe audit artifacts may be written. Write and validate canonical ./service/.observe/otel-audit.json, then render self-contained ./service/.observe/otel.html from that JSON."
+    },
+    {
+      "id": "readiness-review",
+      "task": "Produce an observability readiness review for the Java Spring Boot service in ./service. Identify existing telemetry, missing OpenTelemetry coverage, and the next instrumentation step. Do not modify service code, dependencies, configuration, or tests. Only the required .observe audit artifacts may be written. Write and validate canonical ./service/.observe/otel-audit.json, then render self-contained ./service/.observe/otel.html from that JSON."
+    }
+  ],
+  "judge_inputs": [
+    "Inspect ./service for resulting files when present.",
+    "Read ./last_message.md for the agent final response.",
+    "Read ./grade.json for run guard checks."
+  ],
+  "rubric": [
+    "Identifies TasksApplication.java as the process entry point.",
+    "Identifies TaskController routes for health and task CRUD operations.",
+    "Reports no OpenTelemetry SDK, Java agent, or OTLP exporter configuration.",
+    "Reports missing HTTP request rate, error status, and latency visibility with exact expected signals.",
+    "Recommends the OpenTelemetry Java agent as the primary Spring Boot instrumentation path.",
+    "Classifies the missing Java-agent application-log path to local Splunk Observability Studio as a required default gap, while preserving explicit opt-out/operator ownership and keeping cloud forwarding limited to traces and metrics."
+  ]
+}

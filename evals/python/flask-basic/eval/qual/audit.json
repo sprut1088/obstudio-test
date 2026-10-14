@@ -1,0 +1,26 @@
+{
+  "skill": "otel-audit",
+  "prompts": [
+    {
+      "id": "direct",
+      "task": "Scan the Flask service in ./service for observability gaps. Do not modify service code, dependencies, configuration, or tests. Only the required .observe audit artifacts may be written. Write and validate canonical ./service/.observe/otel-audit.json, then render self-contained ./service/.observe/otel.html from that JSON."
+    },
+    {
+      "id": "readiness-review",
+      "task": "Produce an observability readiness review for the Flask service in ./service. Identify existing telemetry, missing OpenTelemetry coverage, and the next instrumentation step. Do not modify service code, dependencies, configuration, or tests. Only the required .observe audit artifacts may be written. Write and validate canonical ./service/.observe/otel-audit.json, then render self-contained ./service/.observe/otel.html from that JSON."
+    }
+  ],
+  "judge_inputs": [
+    "Inspect ./service for resulting files when present.",
+    "Read ./last_message.md for the agent final response.",
+    "Read ./grade.json for run guard checks."
+  ],
+  "rubric": [
+    "Identifies app.py and pyproject.toml as the relevant entrypoint and dependency files.",
+    "Enumerates the Flask task CRUD routes and health route.",
+    "Reports no opentelemetry packages and no SDK initialization.",
+    "Mentions opentelemetry-instrumentation-flask as the auto-instrumentation gap.",
+    "Calls out request duration, rate, errors, and OTLP exporter configuration.",
+    "Classifies the missing supported stdlib application-log bridge and local Splunk Observability Studio exporter as a required default gap, while preserving explicit opt-out/operator ownership and keeping cloud forwarding limited to traces and metrics. Resolves the current local OTLP endpoint from configuration or advertised receiver state before using the 4317/4318 fallbacks, preserves a configured non-default port, and does not require application startup to query Obstudio."
+  ]
+}

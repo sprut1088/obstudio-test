@@ -1,0 +1,15 @@
+[project]
+name = "python-ai-assistant-demo"
+version = "0.1.0"
+description = "AI assistant-like FastAPI app for OTel GenAI skill demos"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "httpx>=0.28",
+    "uvicorn[standard]>=0.34",
+]
+
+[project.optional-dependencies]
+evaluation = [
+    "splunk-ao==0.4.0",
+]

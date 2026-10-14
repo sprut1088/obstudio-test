@@ -1,0 +1,50 @@
+node_modules/
+dist/
+**/dist/
+build/
+.release/
+
+__pycache__/
+**/__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+uv.lock
+!tests/uv.lock
+!pytest-codex-evals/uv.lock
+*.db
+.pytest_cache/
+
+# Compiled binaries and embedded staging
+observer/obstudio
+observer/build-client
+observer/cmd/obstudio/_skills/
+observer/internal/web/static/assets/
+observer/client/public/assets/
+
+# Generated local OTel skill reports
+.observe/
+
+# Eval fixture apps -- track baselines, ignore generated artifacts
+evals/**/.observe/
+evals/**/.venv/
+evals/**/__pycache__/
+evals/**/uv.lock
+!evals/uv.lock
+evals/**/*.db
+evals/**/otel_setup.py
+evals/**/otel_*.py
+evals/**/go.sum
+
+# Skill eval workspaces
+.workspace/
+pytest-codex-evals/dist/
+
+.idea
+.deepeval/
+.npmrc
+.DS_Store
+.claude/
+
+# graphify-axet
+.graphify/
